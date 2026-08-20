@@ -82,22 +82,81 @@ def get_active_proxy() -> Optional[str]:
     return None
 
 
-def get_cookie_file_path() -> Optional[str]:
-    """Find local cookie file or write environment variable YOUTUBE_COOKIES to a temp file."""
-    raw_cookies = (
-        os.environ.get("YOUTUBE_COOKIES") or
-        os.environ.get("YT_COOKIES") or
-        os.environ.get("COOKIES")
-    )
-    if raw_cookies and raw_cookies.strip():
-        try:
-            tf = tempfile.NamedTemporaryFile(delete=False, suffix="_ytdlp_env_cookie.txt", mode="w", encoding="utf-8")
-            tf.write(raw_cookies.strip() + "\n")
-            tf.close()
-            return tf.name
-        except Exception as e:
-            print(f"[Cookies] Failed to write temp cookie from env: {e}")
+def format_netscape_cookies(raw_text: str) -> str:
+    """Auto-detect and format cookies from Netscape text, JSON, or Base64 into valid Netscape format."""
+    raw = raw_text.strip()
+    if not raw:
+        return ""
 
+    # 1. Decode base64 if detected
+    if not raw.startswith("#") and not raw.startswith(".") and not raw.startswith("[") and len(raw) > 20:
+        try:
+            import base64
+            decoded = base64.b64decode(raw).decode("utf-8", errors="ignore").strip()
+            if decoded.startswith("#") or "youtube" in decoded or decoded.startswith("["):
+                raw = decoded
+        except Exception:
+            pass
+
+    # 2. Convert JSON cookie format (from Chrome extensions) to Netscape
+    if raw.startswith("[") or raw.startswith("{"):
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                data = [data]
+            lines = ["# Netscape HTTP Cookie File"]
+            for c in data:
+                dom = c.get("domain", ".youtube.com")
+                sub = "TRUE" if dom.startswith(".") else "FALSE"
+                path = c.get("path", "/")
+                sec = "TRUE" if c.get("secure", False) else "FALSE"
+                exp = str(int(c.get("expirationDate") or c.get("expiry") or (time.time() + 86400 * 365)))
+                name = c.get("name", "")
+                val = c.get("value", "")
+                if name and val:
+                    lines.append(f"{dom}\t{sub}\t{path}\t{sec}\t{exp}\t{name}\t{val}")
+            if len(lines) > 1:
+                return "\n".join(lines) + "\n"
+        except Exception:
+            pass
+
+    # 3. Clean and normalize Netscape cookie text lines
+    lines = ["# Netscape HTTP Cookie File"]
+    for l in raw.splitlines():
+        line_clean = l.strip()
+        if not line_clean or line_clean.startswith("#"):
+            continue
+        parts = re.split(r"\t+|\s{2,}", line_clean)
+        if len(parts) >= 7:
+            lines.append("\t".join(parts[:7]))
+        elif len(parts) == 6:
+            lines.append(f"{parts[0]}\tTRUE\t{parts[1]}\tTRUE\t{parts[2]}\t{parts[3]}\t{parts[4]}")
+
+    if len(lines) > 1:
+        return "\n".join(lines) + "\n"
+    return ""
+
+
+def get_cookie_file_path() -> Optional[str]:
+    """Find local cookie file or write environment variable YOUTUBE_COOKIES to a validated Netscape temp file."""
+    # Check env variables: YOUTUBE_COOKIES, YOUTUBE_COOKIES_1..N, YT_COOKIES, COOKIES
+    env_cookie_candidates = []
+    for k, v in os.environ.items():
+        if (k.startswith("YOUTUBE_COOKIE") or k.startswith("YT_COOKIE") or k == "COOKIES") and v.strip():
+            env_cookie_candidates.append(v.strip())
+
+    for raw_content in env_cookie_candidates:
+        formatted = format_netscape_cookies(raw_content)
+        if formatted and len(formatted.splitlines()) > 1:
+            try:
+                tf = tempfile.NamedTemporaryFile(delete=False, suffix="_ytdlp_env_cookie.txt", mode="w", encoding="utf-8")
+                tf.write(formatted)
+                tf.close()
+                return tf.name
+            except Exception as e:
+                print(f"[Cookies] Failed to write temp cookie from env: {e}")
+
+    # Check candidate local files
     candidate_paths = [
         "cookie.txt",
         "cookies.txt",
@@ -109,7 +168,17 @@ def get_cookie_file_path() -> Optional[str]:
     ]
     for cp in candidate_paths:
         if os.path.exists(cp) and os.path.getsize(cp) > 10:
-            return os.path.abspath(cp)
+            try:
+                with open(cp, "r", encoding="utf-8", errors="ignore") as f:
+                    file_content = f.read()
+                cleaned_content = format_netscape_cookies(file_content)
+                if cleaned_content:
+                    tf = tempfile.NamedTemporaryFile(delete=False, suffix="_local_cookie.txt", mode="w", encoding="utf-8")
+                    tf.write(cleaned_content)
+                    tf.close()
+                    return tf.name
+            except Exception:
+                return os.path.abspath(cp)
 
     return None
 
