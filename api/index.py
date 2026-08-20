@@ -280,22 +280,28 @@ def download_stream(
             tmp_dir = tempfile.mkdtemp(prefix="ytdl_")
             out_template = os.path.join(tmp_dir, "%(title)s.%(ext)s")
 
+            has_ffmpeg = bool(shutil.which('ffmpeg'))
+
             if audio_only:
-                # Genuine MP3 conversion using FFmpegExtractAudio
                 ydl_opts = {
                     'format': 'bestaudio/best',
                     'outtmpl': out_template,
                     'quiet': True,
                     'no_warnings': True,
-                    'postprocessors': [{
+                }
+                if has_ffmpeg:
+                    ydl_opts['postprocessors'] = [{
                         'key': 'FFmpegExtractAudio',
                         'preferredcodec': 'mp3',
                         'preferredquality': '192',
                     }]
-                }
             else:
+                if has_ffmpeg:
+                    fmt = f"{itag}+bestaudio/best" if itag.isdigit() else "bestvideo+bestaudio/best/best"
+                else:
+                    fmt = f"{itag}/bestvideo+bestaudio/best"
                 ydl_opts = {
-                    'format': f"{itag}+bestaudio/best" if itag.isdigit() else "bestvideo+bestaudio/best/best",
+                    'format': fmt,
                     'outtmpl': out_template,
                     'quiet': True,
                     'no_warnings': True,
@@ -417,6 +423,7 @@ def playlist_zip_sse(
 
                 yield f"data: {json.dumps({'type': 'progress', 'current': i, 'total': total_tracks, 'title': track_title, 'percent': percent, 'eta': eta_text})}\n\n"
 
+                has_ffmpeg = bool(shutil.which('ffmpeg'))
                 out_tmpl = os.path.join(tracks_dir, f"{i:02d} - %(title)s.%(ext)s")
                 if audio_only:
                     ydl_opts_dl = {
@@ -425,15 +432,16 @@ def playlist_zip_sse(
                         'quiet': True,
                         'no_warnings': True,
                         'ignoreerrors': True,
-                        'postprocessors': [{
+                    }
+                    if has_ffmpeg:
+                        ydl_opts_dl['postprocessors'] = [{
                             'key': 'FFmpegExtractAudio',
                             'preferredcodec': 'mp3',
                             'preferredquality': '192',
                         }]
-                    }
                 else:
                     ydl_opts_dl = {
-                        'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+                        'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best' if has_ffmpeg else 'best[height<=720]/best',
                         'outtmpl': out_tmpl,
                         'quiet': True,
                         'no_warnings': True,
