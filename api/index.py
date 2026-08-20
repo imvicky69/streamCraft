@@ -543,6 +543,15 @@ async def download_single_sse(
     ACTIVE_DOWNLOADS[current_download_id] = cancel_event
 
     msg_queue: queue.Queue = queue.Queue()
+    # Put immediate initial progress event so the client un-hangs immediately
+    msg_queue.put({
+        "type": "progress",
+        "percent": 8,
+        "receivedMB": "0.1",
+        "speed": "Starting...",
+        "eta": "Few seconds",
+        "status": "Connecting to YouTube stream...",
+    })
 
     def run_download():
         temp_dir = tempfile.mkdtemp(prefix="streamcraft_single_")
@@ -558,12 +567,12 @@ async def download_single_sse(
                     speed = d.get("speed")
                     eta = d.get("eta")
 
-                    percent = 0
+                    percent = 10.0
                     if total > 0:
-                        percent = min(99.0, max(1.0, (downloaded / total) * 100))
+                        percent = min(98.0, max(10.0, (downloaded / total) * 100))
 
-                    speed_str = format_size(int(speed)) + "/s" if speed else "Calculating..."
-                    eta_str = f"{int(eta)}s" if eta is not None else "Calculating..."
+                    speed_str = format_size(int(speed)) + "/s" if speed else "Streaming..."
+                    eta_str = f"{int(eta)}s" if eta is not None else "Few seconds"
 
                     msg_queue.put({
                         "type": "progress",
@@ -613,7 +622,7 @@ async def download_single_sse(
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info_dict = ydl.extract_info(raw_url, download=True)
-                title = info_dict.get("title", "media")
+                title = info_dict.get("title", "media") if info_dict else "media"
 
             downloaded_files = [
                 os.path.join(temp_dir, f) for f in os.listdir(temp_dir)
@@ -647,10 +656,11 @@ async def download_single_sse(
             })
 
         except yt_dlp.utils.DownloadCancelled:
-            msg_queue.put({"type": "error", "message": "Download was cancelled."})
+            msg_queue.put({"type": "error", "message": "Download was cancelled by user."})
             shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception as e:
-            msg_queue.put({"type": "error", "message": str(e)})
+            print(f"[Download Error] {e}")
+            msg_queue.put({"type": "error", "message": f"Download error: {str(e)}"})
             shutil.rmtree(temp_dir, ignore_errors=True)
         finally:
             ACTIVE_DOWNLOADS.pop(current_download_id, None)
@@ -661,7 +671,7 @@ async def download_single_sse(
     async def event_generator():
         while True:
             try:
-                msg = msg_queue.get(timeout=45.0)
+                msg = msg_queue.get(timeout=1.0)
                 yield f"data: {json.dumps(msg)}\n\n"
                 if msg.get("type") in ("complete", "error"):
                     break
@@ -672,7 +682,7 @@ async def download_single_sse(
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         }
@@ -846,7 +856,7 @@ async def playlist_zip_sse(
     async def event_generator():
         while True:
             try:
-                msg = msg_queue.get(timeout=60.0)
+                msg = msg_queue.get(timeout=1.0)
                 yield f"data: {json.dumps(msg)}\n\n"
                 if msg.get("type") in ("complete", "error"):
                     break
@@ -857,7 +867,7 @@ async def playlist_zip_sse(
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         }
