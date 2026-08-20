@@ -46,21 +46,28 @@ export default function App() {
 
   const handleFetchInfo = async (overrideUrl) => {
     const targetUrl = overrideUrl || url;
-    let cleanInput = targetUrl.trim().replace(/\s+/g, '');
+    let cleanInput = targetUrl.trim();
     if (!cleanInput) return;
 
-    if (!cleanInput.startsWith('http://') && !cleanInput.startsWith('https://')) {
-      cleanInput = 'https://' + cleanInput;
-    }
+    const isExplicitUrl = cleanInput.startsWith('http://') || 
+                          cleanInput.startsWith('https://') || 
+                          cleanInput.includes('youtube.com') || 
+                          cleanInput.includes('youtu.be');
 
-    // Strip radio mix / playlist params from single watch URLs
-    if (cleanInput.includes('watch?v=') && cleanInput.includes('&list=')) {
-      cleanInput = cleanInput.split('&list=')[0];
+    if (isExplicitUrl) {
+      cleanInput = cleanInput.replace(/\s+/g, '');
+      if (!cleanInput.startsWith('http://') && !cleanInput.startsWith('https://')) {
+        cleanInput = 'https://' + cleanInput;
+      }
+      // Strip radio mix / playlist params from single watch URLs
+      if (cleanInput.includes('watch?v=') && cleanInput.includes('&list=')) {
+        cleanInput = cleanInput.split('&list=')[0];
+      }
+      if (cleanInput.includes('watch?v=') && cleanInput.includes('&index=')) {
+        cleanInput = cleanInput.split('&index=')[0];
+      }
+      cleanInput = cleanInput.replace(/[&?]+$/, '');
     }
-    if (cleanInput.includes('watch?v=') && cleanInput.includes('&index=')) {
-      cleanInput = cleanInput.split('&index=')[0];
-    }
-    cleanInput = cleanInput.replace(/[&?]+$/, '');
 
     setUrl(cleanInput);
 

@@ -275,10 +275,11 @@ def init_cookie_pool():
 init_cookie_pool()
 
 
-def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
+def get_base_ydl_opts(cookie_idx: Optional[int] = None, use_cookies: bool = True) -> dict:
     """
     Build yt-dlp options with:
-    - Cookie pool rotation
+    - Cookie pool rotation (if enabled)
+    - JS challenge solving via node / remote components
     - Proxy support (PROXY_URL env var)
     - PO token support (PO_TOKEN env var)
     """
@@ -287,11 +288,13 @@ def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
         init_cookie_pool()
 
     cookie_file_path = None
-    if COOKIE_FILES:
+    if use_cookies and COOKIE_FILES:
         if cookie_idx is not None and 0 <= cookie_idx < len(COOKIE_FILES):
             cookie_file_path = COOKIE_FILES[cookie_idx]
         else:
             cookie_file_path = random.choice(COOKIE_FILES)
+
+    extractor_args = {'youtube': {}}
 
     # Player client order: web + ios + mweb + android gives full 1080p/720p DASH video formats
     if PO_TOKEN:
@@ -299,10 +302,8 @@ def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
         extractor_args['youtube']['player_client'] = ['web', 'ios', 'mweb', 'android']
     elif PROXY_URL:
         extractor_args['youtube']['player_client'] = ['web', 'ios', 'mweb', 'android']
-    elif cookie_file_path:
-        extractor_args['youtube']['player_client'] = ['tv_embedded', 'web_embedded', 'mweb', 'ios', 'web']
-    else:
-        extractor_args['youtube']['player_client'] = ['tv_embedded', 'web_embedded', 'mweb']
+
+    has_node = bool(shutil.which('node'))
 
     opts: dict = {
         'quiet': True,
@@ -315,7 +316,6 @@ def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
         'http_chunk_size': 20971520,          # 20MB chunked downloads
         'nocheckcertificate': True,
         'merge_output_format': 'mp4',
-        'extractor_args': extractor_args,
         'http_headers': {
             'User-Agent': (
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -329,6 +329,13 @@ def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
         'geo_bypass_country': 'US',
     }
 
+    if extractor_args.get('youtube'):
+        opts['extractor_args'] = extractor_args
+
+    if has_node:
+        opts['js_runtimes'] = {'node': {}}
+        opts['remote_components'] = ['ejs:github']
+
     if cookie_file_path:
         opts['cookiefile'] = cookie_file_path
 
@@ -341,9 +348,10 @@ def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
 def _ytdlp_extract_info(url: str) -> Optional[dict]:
     """
     Try yt-dlp with multiple strategies:
-    1. If proxy is present: Use proxy with standard clients & cookies
-    2. Default yt-dlp extractor settings
-    3. tv_embedded / web_embedded clients fallback
+    1. Standard with cookies (if loaded)
+    2. Clean direct connection without cookies (fixes expired cookie blocks)
+    3. Multi-client fallback (android, ios, web, mweb)
+    4. Direct connection without proxy (if proxy is configured)
     Returns None if all fail so fallbacks (Innertube/Invidious) can run.
     """
     if not HAS_YTDLP:
@@ -352,33 +360,28 @@ def _ytdlp_extract_info(url: str) -> Optional[dict]:
     base_extract_opts = {'skip_download': True, 'extract_flat': 'in_playlist'}
     strategies = []
 
-    # Strategy 1: Standard with configured options
-    s1 = get_base_ydl_opts()
+    # Strategy 1: Standard with configured options (with cookies if any)
+    s1 = get_base_ydl_opts(use_cookies=True)
     s1.update(base_extract_opts)
     strategies.append(("primary", s1))
 
-    # Strategy 2: Default yt-dlp player clients (no extractor_args override)
-    s2 = get_base_ydl_opts()
-    s2.pop('extractor_args', None)
+    # Strategy 2: Clean without cookies (fixes "The page needs to be reloaded" or expired cookies)
+    s2 = get_base_ydl_opts(use_cookies=False)
     s2.update(base_extract_opts)
-    strategies.append(("default-clients", s2))
+    strategies.append(("clean-no-cookies", s2))
 
-    # Strategy 3: TV client without cookies
-    s3 = get_base_ydl_opts()
-    s3.pop('cookiefile', None)
+    # Strategy 3: Multi-client without cookies
+    s3 = get_base_ydl_opts(use_cookies=False)
     s3['extractor_args'] = {
-        'youtube': {'player_client': ['tv_embedded', 'web_embedded', 'mweb']}
+        'youtube': {'player_client': ['android', 'ios', 'web', 'mweb']}
     }
     s3.update(base_extract_opts)
-    strategies.append(("tv-embedded-no-cookie", s3))
+    strategies.append(("multi-client-no-cookies", s3))
 
     # Strategy 4: Direct connection without proxy (in case proxy is down or throws 502 Bad Gateway)
     if PROXY_URL:
-        s4 = get_base_ydl_opts()
+        s4 = get_base_ydl_opts(use_cookies=False)
         s4.pop('proxy', None)
-        s4['extractor_args'] = {
-            'youtube': {'player_client': ['tv_embedded', 'web_embedded', 'mweb']}
-        }
         s4.update(base_extract_opts)
         strategies.append(("direct-no-proxy-fallback", s4))
 
@@ -998,22 +1001,39 @@ async def download_single_sse(
             try:
                 strategies_dl = []
 
-                # Strategy 1: High-Speed Direct Stream (Google CDN does not throttle, full 10-20 MB/s speed)
-                s1 = get_base_ydl_opts()
+                # Multi-strategy downloading for robustness
+                s1 = get_base_ydl_opts(use_cookies=True)
                 s1.pop('proxy', None)
                 s1['outtmpl'] = out_template
                 s1['progress_hooks'] = [progress_hook]
                 _build_fmt(s1)
-                strategies_dl.append(("direct-high-speed", s1))
+                strategies_dl.append(("direct-with-cookies", s1))
 
-                # Strategy 2: Proxy Fallback (if direct connection encounters bot error)
+                # Strategy 2: Clean no-cookies mode (bypasses expired/flagged cookie issues)
+                s2 = get_base_ydl_opts(use_cookies=False)
+                s2.pop('proxy', None)
+                s2['outtmpl'] = out_template
+                s2['progress_hooks'] = [progress_hook]
+                _build_fmt(s2)
+                strategies_dl.append(("clean-no-cookies", s2))
+
+                # Strategy 3: Multi-client fallback
+                s3 = get_base_ydl_opts(use_cookies=False)
+                s3.pop('proxy', None)
+                s3['outtmpl'] = out_template
+                s3['progress_hooks'] = [progress_hook]
+                s3['extractor_args'] = {'youtube': {'player_client': ['android', 'ios', 'web', 'mweb']}}
+                _build_fmt(s3)
+                strategies_dl.append(("multi-client-no-cookies", s3))
+
+                # Strategy 4: Proxy Fallback (if direct connection encounters bot error)
                 if PROXY_URL:
-                    s2 = get_base_ydl_opts()
-                    s2['proxy'] = PROXY_URL
-                    s2['outtmpl'] = out_template
-                    s2['progress_hooks'] = [progress_hook]
-                    _build_fmt(s2)
-                    strategies_dl.append(("proxy-fallback", s2))
+                    s4 = get_base_ydl_opts(use_cookies=False)
+                    s4['proxy'] = PROXY_URL
+                    s4['outtmpl'] = out_template
+                    s4['progress_hooks'] = [progress_hook]
+                    _build_fmt(s4)
+                    strategies_dl.append(("proxy-fallback", s4))
 
                 info_res = None
                 dl_file = None
@@ -1226,28 +1246,28 @@ def download_stream(
             # Multi-strategy download
             strategies_dl = []
 
-            s1 = get_base_ydl_opts()
+            s1 = get_base_ydl_opts(use_cookies=True)
             s1['outtmpl'] = out_template
             _build_fmt(s1)
             strategies_dl.append(("cookies+optimal", s1))
 
-            if COOKIE_FILES:
-                s2 = get_base_ydl_opts()
-                s2.pop('cookiefile', None)
-                s2['outtmpl'] = out_template
-                s2['extractor_args'] = {'youtube': {'player_client': ['tv_embedded', 'web_embedded']}}
-                if PROXY_URL:
-                    s2['proxy'] = PROXY_URL
-                _build_fmt(s2)
-                strategies_dl.append(("no-cookies+tv_embedded", s2))
+            s2 = get_base_ydl_opts(use_cookies=False)
+            s2['outtmpl'] = out_template
+            _build_fmt(s2)
+            strategies_dl.append(("clean-no-cookies", s2))
+
+            s3 = get_base_ydl_opts(use_cookies=False)
+            s3['outtmpl'] = out_template
+            s3['extractor_args'] = {'youtube': {'player_client': ['android', 'ios', 'web', 'mweb']}}
+            _build_fmt(s3)
+            strategies_dl.append(("multi-client-no-cookies", s3))
 
             if PROXY_URL:
-                s3 = get_base_ydl_opts()
-                s3['proxy'] = PROXY_URL
-                s3['outtmpl'] = out_template
-                s3['extractor_args'] = {'youtube': {'player_client': ['web', 'tv_embedded', 'ios', 'android']}}
-                _build_fmt(s3)
-                strategies_dl.append(("proxy+all-clients", s3))
+                s4 = get_base_ydl_opts(use_cookies=False)
+                s4['proxy'] = PROXY_URL
+                s4['outtmpl'] = out_template
+                _build_fmt(s4)
+                strategies_dl.append(("proxy+fallback", s4))
 
             info = None
             downloaded_file = None
