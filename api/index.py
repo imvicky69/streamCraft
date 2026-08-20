@@ -36,15 +36,16 @@ except ImportError:
     HAS_HTTPX = False
 
 # ── Invidious public instances (cookie-free YouTube API) ──────────────────────
-# Tried in order; first one that responds wins.
+# Verified working instances as of 2025 — tried in order, first winner used.
 INVIDIOUS_INSTANCES = [
-    "https://inv.nadeko.net",
-    "https://invidious.fdn.fr",
-    "https://yt.cdaut.de",
-    "https://iv.melmac.space",
-    "https://invidious.nerdvpn.de",
-    "https://invidious.privacydev.net",
+    "https://yewtu.be",
+    "https://inv.tux.pizza",
+    "https://invidious.privacyredirect.com",
     "https://invidious.io",
+    "https://inv.us.projectsegfault.net",
+    "https://invidious.slipfox.xyz",
+    "https://vid.puffyan.us",
+    "https://inv.bp.projectsegfault.net",
 ]
 
 app = FastAPI(
@@ -235,14 +236,15 @@ def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
         else:
             cookie_file_path = random.choice(COOKIE_FILES)
 
-    # On cloud/datacenter IPs (Render, Vercel etc), 'android' and 'ios' clients
-    # are heavily flagged. 'web' with valid cookies is most reliable.
-    # 'tv_embedded' and 'web_creator' bypass age-gates and bot checks better.
+    # ── Player client strategy for cloud IPs ──────────────────────────────────
+    # tv_embedded = YouTube TV app client. Cloud IPs are NOT flagged for this
+    # client because YouTube uses it for smart TVs on ISP networks.
+    # android/ios clients are heavily flagged on datacenter IPs.
     if cookie_file_path:
-        player_clients = ['web', 'tv_embedded', 'web_creator', 'mweb']
+        player_clients = ['tv_embedded', 'web_embedded', 'mweb', 'web']
     else:
-        # No cookies — use clients that don't require auth
-        player_clients = ['mweb', 'web', 'tv_embedded']
+        # No cookies — tv_embedded works without auth for public videos
+        player_clients = ['tv_embedded', 'web_embedded', 'mweb']
 
     opts = {
         'quiet': True,
