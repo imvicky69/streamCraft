@@ -279,6 +279,42 @@ def health():
     }
 
 
+@app.get("/api/debug")
+def debug():
+    """Test all Invidious instances and report connectivity from this server."""
+    results = {}
+    TEST_VIDEO = "dQw4w9WgXcQ"  # Rick Astley — always public
+    if HAS_HTTPX:
+        for instance in INVIDIOUS_INSTANCES:
+            try:
+                url = f"{instance}/api/v1/videos/{TEST_VIDEO}?fields=title"
+                resp = httpx.get(url, timeout=8, follow_redirects=True)
+                results[instance] = {
+                    "status": resp.status_code,
+                    "ok": resp.status_code == 200,
+                    "title": resp.json().get("title", "N/A") if resp.status_code == 200 else None
+                }
+            except Exception as e:
+                results[instance] = {"status": "error", "ok": False, "error": str(e)[:80]}
+    else:
+        results["error"] = "httpx not installed"
+
+    ytdlp_version = "not installed"
+    if HAS_YTDLP:
+        try:
+            ytdlp_version = yt_dlp.version.__version__
+        except Exception:
+            ytdlp_version = "unknown"
+
+    return {
+        "invidious_instances": results,
+        "working_instances": [k for k, v in results.items() if isinstance(v, dict) and v.get("ok")],
+        "yt_dlp_version": ytdlp_version,
+        "cookies_loaded": len(COOKIE_FILES),
+        "cookie_files": COOKIE_FILES,
+    }
+
+
 # ── Invidious cookie-free helpers ─────────────────────────────────────────────
 
 def extract_video_id(url: str) -> Optional[str]:
