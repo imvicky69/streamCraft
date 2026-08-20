@@ -317,78 +317,134 @@ def debug():
     }
 
 
-# ── Invidious cookie-free helpers ─────────────────────────────────────────────
+# ── Cookie-free fallback engines ──────────────────────────────────────────────
 
 def extract_video_id(url: str) -> Optional[str]:
     """Extract YouTube video ID from any URL format."""
-    patterns = [
-        r'(?:v=|youtu\.be/|/embed/|/v/|/watch\?v=)([A-Za-z0-9_-]{11})',
-    ]
-    for p in patterns:
-        m = re.search(p, url)
-        if m:
-            return m.group(1)
-    return None
+    m = re.search(r'(?:v=|youtu\.be/|/embed/|/v/|/watch\?v=)([A-Za-z0-9_-]{11})', url)
+    return m.group(1) if m else None
 
 
-def invidious_get_info(video_id: str) -> Optional[dict]:
-    """Fetch video info from Invidious API — no cookies needed."""
+YT_INNERTUBE_CLIENTS = [
+    # Smart TV embedded player — lowest bot-detection on cloud IPs
+    {
+        "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+        "clientVersion": "2.0",
+        "clientScreen": "EMBED",
+        "key": "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+        "user_agent": "Mozilla/5.0 (SMART-TV; LINUX; Tizen 5.5) AppleWebKit/537.36",
+    },
+    # Android VR client — secondary option
+    {
+        "clientName": "ANDROID_VR",
+        "clientVersion": "1.56.21",
+        "androidSdkVersion": 32,
+        "key": "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+        "user_agent": "com.google.android.apps.youtube.vr.oculus/1.56.21 (Linux; U; Android 12) gzip",
+    },
+    # IOS Messages Extension — tertiary option
+    {
+        "clientName": "IOS_MESSAGES_EXTENSION",
+        "clientVersion": "19.29.1",
+        "deviceModel": "iPhone16,2",
+        "osVersion": "17.5.1.21F90",
+        "key": "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc",
+        "user_agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)",
+    },
+]
+
+
+def innertube_get_info(video_id: str) -> Optional[dict]:
+    """Call YouTube's own internal API (Innertube) — no cookies, minimal bot detection."""
     if not HAS_HTTPX:
         return None
-    fields = "title,author,lengthSeconds,viewCount,videoThumbnails,adaptiveFormats,formatStreams,description"
-    for instance in INVIDIOUS_INSTANCES:
+
+    for client_cfg in YT_INNERTUBE_CLIENTS:
         try:
-            url = f"{instance}/api/v1/videos/{video_id}?fields={fields}"
-            resp = httpx.get(url, timeout=12, follow_redirects=True)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("title"):
-                    return data
+            key = client_cfg["key"]
+            api_url = f"https://www.youtube.com/youtubei/v1/player?key={key}&prettyPrint=false"
+
+            ctx: dict = {
+                "clientName": client_cfg["clientName"],
+                "clientVersion": client_cfg["clientVersion"],
+                "hl": "en",
+                "gl": "US",
+                "utcOffsetMinutes": 0,
+            }
+            if "androidSdkVersion" in client_cfg:
+                ctx["androidSdkVersion"] = client_cfg["androidSdkVersion"]
+            if "deviceModel" in client_cfg:
+                ctx["deviceModel"] = client_cfg["deviceModel"]
+            if "osVersion" in client_cfg:
+                ctx["osVersion"] = client_cfg["osVersion"]
+
+            payload = {
+                "videoId": video_id,
+                "context": {"client": ctx},
+                "racyCheckOk": True,
+                "contentCheckOk": True,
+            }
+
+            resp = httpx.post(
+                api_url, json=payload, timeout=15,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": client_cfg["user_agent"],
+                    "Origin": "https://www.youtube.com",
+                    "X-YouTube-Client-Name": client_cfg["clientName"],
+                    "X-YouTube-Client-Version": client_cfg["clientVersion"],
+                }
+            )
+
+            if resp.status_code != 200:
+                print(f"Innertube {client_cfg['clientName']} returned {resp.status_code}")
+                continue
+
+            data = resp.json()
+            status = data.get("playabilityStatus", {}).get("status", "")
+            if status == "OK":
+                return data
+            print(f"Innertube {client_cfg['clientName']}: playabilityStatus={status}")
+
         except Exception as e:
-            print(f"Invidious instance {instance} failed: {e}")
+            print(f"Innertube {client_cfg['clientName']} failed: {e}")
             continue
+
     return None
 
 
-def invidious_info_to_response(data: dict, url: str) -> dict:
-    """Convert Invidious API response to our standard API response format."""
-    title = data.get("title", "Unknown Title")
-    author = data.get("author", "Unknown")
-    duration = data.get("lengthSeconds", 0)
-    views = data.get("viewCount", 0)
+def innertube_to_response(data: dict, video_id: str) -> dict:
+    """Convert Innertube player response to our standard API format."""
+    details = data.get("videoDetails", {})
+    title = details.get("title", "Unknown Title")
+    author = details.get("author", "Unknown")
+    duration = int(details.get("lengthSeconds", 0))
+    views = int(details.get("viewCount", 0))
+    thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
 
-    # Best thumbnail
-    thumbnails = data.get("videoThumbnails", [])
-    thumbnail = next((t["url"] for t in thumbnails if t.get("quality") in ["maxres", "high", "medium"]), "")
-    # Make thumbnail URL absolute if relative
-    if thumbnail and thumbnail.startswith("/"):
-        thumbnail = f"https://i.ytimg.com{thumbnail}"
+    streaming = data.get("streamingData", {})
+    adaptive = streaming.get("adaptiveFormats", [])
+    combined = streaming.get("formats", [])
 
-    # Video streams from adaptiveFormats
     seen_res = set()
     video_streams = []
-    for f in data.get("adaptiveFormats", []):
-        height = f.get("resolution", "").replace("p", "")
+    for f in adaptive + combined:
+        height = f.get("height")
         if not height:
             continue
-        try:
-            height = int(height)
-        except Exception:
-            continue
-        vcodec = f.get("encoding", "")
-        mime = f.get("type", "")
+        mime = f.get("mimeType", "")
         if "video" not in mime:
             continue
         res_str = f"{height}p"
         if res_str not in seen_res:
             seen_res.add(res_str)
-            filesize = f.get("clen") or 0
+            filesize = f.get("contentLength")
             try:
-                filesize = int(filesize)
+                filesize = int(filesize) if filesize else 0
             except Exception:
                 filesize = 0
             video_streams.append({
-                "itag": f.get("itag", res_str),
+                "itag": str(f.get("itag", res_str)),
                 "resolution": res_str,
                 "fps": f.get("fps", 30),
                 "mime_type": "video/mp4",
@@ -396,18 +452,18 @@ def invidious_info_to_response(data: dict, url: str) -> dict:
                 "filesize": filesize,
                 "filesize_formatted": format_size(filesize) if filesize else "HD Stream",
                 "has_audio": True,
-                "_invidious_url": f.get("url", ""),  # direct stream URL
             })
 
-    # Sort by resolution
-    video_streams.sort(key=lambda x: int(re.search(r'(\d+)', x['resolution']).group(1)) if re.search(r'(\d+)', x['resolution']) else 0, reverse=True)
+    video_streams.sort(
+        key=lambda x: int(re.search(r'(\d+)', x['resolution']).group(1)) if re.search(r'(\d+)', x['resolution']) else 0,
+        reverse=True
+    )
 
-    # Audio streams
     approx_320 = int((320 * 1000 / 8) * duration) if duration else 0
     approx_192 = int((192 * 1000 / 8) * duration) if duration else 0
     approx_128 = int((128 * 1000 / 8) * duration) if duration else 0
     audio_streams = [
-        {"itag": "bestaudio", "abr": "320kbps", "mime_type": "audio/mp3", "extension": "mp3",
+        {"itag": "bestaudio",     "abr": "320kbps", "mime_type": "audio/mp3", "extension": "mp3",
          "filesize": approx_320, "filesize_formatted": format_size(approx_320, is_approx=True) if duration else "320 kbps MP3"},
         {"itag": "bestaudio_192", "abr": "192kbps", "mime_type": "audio/mp3", "extension": "mp3",
          "filesize": approx_192, "filesize_formatted": format_size(approx_192, is_approx=True) if duration else "192 kbps MP3"},
@@ -422,11 +478,79 @@ def invidious_info_to_response(data: dict, url: str) -> dict:
         "length_seconds": duration,
         "length_formatted": format_duration(duration),
         "views": views,
-        "thumbnail_url": thumbnail,
+        "thumbnail_url": thumbnail_url,
         "video_streams": video_streams,
         "audio_streams": audio_streams,
-        "_source": "invidious",  # debug: shows which engine served this
+        "_source": "innertube",
     }
+
+
+def invidious_get_info(video_id: str) -> Optional[dict]:
+    """Fetch video info from Invidious API — secondary fallback."""
+    if not HAS_HTTPX:
+        return None
+    fields = "title,author,lengthSeconds,viewCount,videoThumbnails,adaptiveFormats,formatStreams"
+    for instance in INVIDIOUS_INSTANCES:
+        try:
+            url = f"{instance}/api/v1/videos/{video_id}?fields={fields}"
+            resp = httpx.get(url, timeout=8, follow_redirects=True)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("title"):
+                    return {"_from_invidious": True, **data}
+        except Exception as e:
+            print(f"Invidious {instance} failed: {e}")
+            continue
+    return None
+
+
+def invidious_info_to_response(data: dict, url: str) -> dict:
+    """Convert Invidious API response to our standard format."""
+    title = data.get("title", "Unknown Title")
+    author = data.get("author", "Unknown")
+    duration = data.get("lengthSeconds", 0)
+    views = data.get("viewCount", 0)
+    thumbnails = data.get("videoThumbnails", [])
+    thumbnail = next((t["url"] for t in thumbnails if t.get("quality") in ["maxres", "high", "medium"]), "")
+    if thumbnail and thumbnail.startswith("/"):
+        thumbnail = f"https://i.ytimg.com{thumbnail}"
+    seen_res, video_streams = set(), []
+    for f in data.get("adaptiveFormats", []):
+        height = f.get("resolution", "").replace("p", "")
+        if not height:
+            continue
+        try:
+            height = int(height)
+        except Exception:
+            continue
+        if "video" not in f.get("type", ""):
+            continue
+        res_str = f"{height}p"
+        if res_str not in seen_res:
+            seen_res.add(res_str)
+            filesize = int(f.get("clen") or 0)
+            video_streams.append({
+                "itag": f.get("itag", res_str), "resolution": res_str, "fps": f.get("fps", 30),
+                "mime_type": "video/mp4", "extension": "mp4", "filesize": filesize,
+                "filesize_formatted": format_size(filesize) if filesize else "HD Stream", "has_audio": True,
+            })
+    video_streams.sort(key=lambda x: int(re.search(r'(\d+)', x['resolution']).group(1) or 0), reverse=True)
+    a320 = int((320*1000/8)*duration) if duration else 0
+    a192 = int((192*1000/8)*duration) if duration else 0
+    a128 = int((128*1000/8)*duration) if duration else 0
+    return {
+        "is_playlist": False, "title": title, "author": author,
+        "length_seconds": duration, "length_formatted": format_duration(duration),
+        "views": views, "thumbnail_url": thumbnail,
+        "video_streams": video_streams,
+        "audio_streams": [
+            {"itag": "bestaudio",     "abr": "320kbps", "mime_type": "audio/mp3", "extension": "mp3", "filesize": a320, "filesize_formatted": format_size(a320, is_approx=True) if duration else "320 kbps MP3"},
+            {"itag": "bestaudio_192", "abr": "192kbps", "mime_type": "audio/mp3", "extension": "mp3", "filesize": a192, "filesize_formatted": format_size(a192, is_approx=True) if duration else "192 kbps MP3"},
+            {"itag": "bestaudio_128", "abr": "128kbps", "mime_type": "audio/mp3", "extension": "mp3", "filesize": a128, "filesize_formatted": format_size(a128, is_approx=True) if duration else "128 kbps MP3"},
+        ],
+        "_source": "invidious",
+    }
+
 
 
 @app.post("/api/info")
@@ -571,18 +695,23 @@ def get_video_info(req: VideoInfoRequest):
                 "cookies" in err_msg.lower()
             )
             if not is_bot_error:
-                # Real error (not bot detection) — raise immediately
                 if "Video unavailable" in err_msg:
                     raise HTTPException(status_code=400, detail="This video is unavailable or private.")
                 raise HTTPException(status_code=400, detail=f"Failed to fetch details: {err_msg}")
+            print(f"yt-dlp bot-detected, trying Innertube fallback...")
 
-            print(f"yt-dlp bot-detected, trying Invidious fallback...")
-            # Fall through to Invidious below
-
-    # ── Invidious cookie-free fallback ────────────────────────────────────────
+    # ── Fallback 1: YouTube Innertube API (Smart TV client, no cookies needed) ──────
     if HAS_HTTPX:
         video_id = extract_video_id(url)
         if video_id:
+            print(f"Trying Innertube API for {video_id}...")
+            innertube_data = innertube_get_info(video_id)
+            if innertube_data:
+                print(f"Innertube success!")
+                return innertube_to_response(innertube_data, video_id)
+
+            # ── Fallback 2: Invidious (public instances) ────────────────────────
+            print(f"Innertube failed, trying Invidious...")
             inv_data = invidious_get_info(video_id)
             if inv_data:
                 return invidious_info_to_response(inv_data, url)
@@ -590,11 +719,12 @@ def get_video_info(req: VideoInfoRequest):
     raise HTTPException(
         status_code=400,
         detail=(
-            "Failed to fetch video info. YouTube is blocking cloud server requests. "
-            "Add YOUTUBE_COOKIES to Render environment variables to bypass this, "
-            "or the video may be private/unavailable."
+            "All engines failed to fetch video info. "
+            "YouTube is blocking this server's IP. "
+            "Please add or refresh YOUTUBE_COOKIES in Render → Environment Variables."
         )
     )
+
 
 
 
