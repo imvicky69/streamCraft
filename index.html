@@ -1,12 +1,37 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" prefix="og: https://ogp.me/ns#">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     
-    <!-- Title & Description -->
-    <title>StreamCraft — Fast HD YouTube Video & Audio Downloader</title>
-    <meta name="description" content="Download YouTube videos in 1080p, 720p, 480p or high quality MP3 audio with instant preview and zero wait time." />
+    <!-- Primary Meta Tags -->
+    <title>StreamCraft — Fast HD YouTube Video & MP3 Audio Downloader</title>
+    <meta name="title" content="StreamCraft — Fast HD YouTube Video & MP3 Audio Downloader" />
+    <meta name="description" content="Download YouTube videos in 1080p Full HD, convert YouTube Music to genuine 320kbps MP3 audio, or download entire playlists as a ZIP archive with real-time speed metrics and zero wait time." />
+    <meta name="keywords" content="youtube downloader, youtube to mp3, 1080p video downloader, youtube music playlist downloader, download youtube playlist zip, mp3 converter, fast video download, streamcraft, free online video downloader" />
+    <meta name="author" content="StreamCraft" />
+    <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1" />
+    <link rel="canonical" href="https://streamcraft.vercel.app/" />
+
+    <!-- Open Graph / Facebook / WhatsApp -->
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://streamcraft.vercel.app/" />
+    <meta property="og:site_name" content="StreamCraft Downloader" />
+    <meta property="og:title" content="StreamCraft — Fast HD YouTube Video & MP3 Audio Downloader" />
+    <meta property="og:description" content="Download YouTube videos in 1080p Full HD, convert YouTube Music to genuine 320kbps MP3 audio, or download entire playlists as a ZIP archive with real-time speed metrics." />
+    <meta property="og:image" content="https://streamcraft.vercel.app/logo.png" />
+    <meta property="og:image:width" content="512" />
+    <meta property="og:image:height" content="512" />
+    <meta property="og:image:alt" content="StreamCraft - High Speed Video and Audio Downloader" />
+    <meta property="og:locale" content="en_US" />
+
+    <!-- Twitter / X Meta Tags -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:url" content="https://streamcraft.vercel.app/" />
+    <meta name="twitter:title" content="StreamCraft — Fast HD YouTube Video & MP3 Audio Downloader" />
+    <meta name="twitter:description" content="Download YouTube videos in 1080p Full HD, convert YouTube Music to genuine 320kbps MP3 audio, or download entire playlists as a ZIP archive." />
+    <meta name="twitter:image" content="https://streamcraft.vercel.app/logo.png" />
+    <meta name="twitter:image:alt" content="StreamCraft Downloader Logo" />
 
     <!-- App Favicon & Icons -->
     <link rel="icon" type="image/png" href="/logo.png" />
@@ -23,11 +48,41 @@
     <link rel="manifest" href="/manifest.json" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="theme-color" content="#0c0e14" />
+    <meta name="color-scheme" content="dark light" />
 
+    <!-- Resource Preconnects for Ultra-Fast Loading -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="dns-prefetch" href="https://i.ytimg.com" />
+    <link rel="dns-prefetch" href="https://www.youtube.com" />
+    
     <!-- Google Fonts: Outfit & Inter -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@500;600;700;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@500;600;700;800&display=swap" rel="stylesheet" />
+
+    <!-- Schema.org JSON-LD Structured Data for Web Application -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "WebApplication",
+      "name": "StreamCraft",
+      "url": "https://streamcraft.vercel.app/",
+      "description": "Download high quality YouTube videos in 1080p, convert to genuine MP3 320kbps, or download playlists as ZIP files.",
+      "applicationCategory": "MultimediaApplication",
+      "operatingSystem": "All",
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "USD"
+      },
+      "featureList": [
+        "1080p Full HD Video Downloads",
+        "320kbps MP3 Audio Conversion",
+        "Playlist ZIP Batch Downloads via SSE",
+        "Live Transfer Speed Gauge",
+        "Mobile Responsive PWA"
+      ]
+    }
+    </script>
   </head>
   <body>
     <div id="root"></div>
