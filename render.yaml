@@ -23,5 +23,16 @@ services:
       # - key: YOUTUBE_COOKIES_2
       #   sync: false
 
+      # RECOMMENDED: Set a residential proxy to bypass Render's blocked datacenter IP.
+      # Free tier: https://webshare.io (10 free residential proxies)
+      # Format: http://user:pass@host:port  OR  socks5://user:pass@host:port
+      # - key: PROXY_URL
+      #   sync: false
+
+      # RECOMMENDED: PO Token (Proof of Origin) — bypasses bot detection on cloud IPs.
+      # How to get: https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide
+      # - key: PO_TOKEN
+      #   sync: false
+
     # Auto-deploy on every push to main
     autoDeploy: true

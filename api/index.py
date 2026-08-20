@@ -4,15 +4,34 @@ import re
 import json
 import time
 import uuid
+import random
+import base64
 import tempfile
 import zipfile
 import shutil
 import urllib.parse
+import subprocess
 from typing import Optional, List, Dict
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
+
+# ── Auto-update yt-dlp at startup (always use latest bypass patches) ──────────
+def _auto_update_ytdlp():
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", "yt-dlp"],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0:
+            print("[startup] yt-dlp upgraded successfully")
+        else:
+            print(f"[startup] yt-dlp upgrade warning: {result.stderr[:200]}")
+    except Exception as e:
+        print(f"[startup] yt-dlp upgrade skipped: {e}")
+
+_auto_update_ytdlp()
 
 # Enable static-ffmpeg if installed
 try:
@@ -28,15 +47,32 @@ try:
 except ImportError:
     HAS_YTDLP = False
 
-# httpx for Invidious API calls (cookie-free fallback)
+# httpx for Invidious / Innertube fallback
 try:
     import httpx
     HAS_HTTPX = True
 except ImportError:
     HAS_HTTPX = False
 
+# ── Proxy configuration ────────────────────────────────────────────────────────
+# Set PROXY_URL in Render → Environment Variables.
+# Format: http://user:pass@host:port  OR  socks5://user:pass@host:port
+# Free residential proxies: webshare.io (10 free), proxyscrape.com
+PROXY_URL: Optional[str] = (
+    os.environ.get("PROXY_URL") or
+    os.environ.get("HTTPS_PROXY") or
+    os.environ.get("HTTP_PROXY") or
+    None
+)
+
+# ── PO Token (Proof of Origin — bypasses bot-detection on datacenter IPs) ─────
+# Set PO_TOKEN in Render → Environment Variables.
+# Generate: https://github.com/YunzheZJU/youtube-po-token-generator
+# Or manually from yt-dlp wiki: open youtube.com in browser and extract token.
+PO_TOKEN: Optional[str] = os.environ.get("PO_TOKEN") or None
+
 # ── Invidious public instances (cookie-free YouTube API) ──────────────────────
-# Verified working instances as of 2025 — tried in order, first winner used.
+# Shuffled randomly on each request to avoid hammering one instance.
 INVIDIOUS_INSTANCES = [
     "https://yewtu.be",
     "https://inv.tux.pizza",
@@ -44,7 +80,11 @@ INVIDIOUS_INSTANCES = [
     "https://invidious.io",
     "https://inv.us.projectsegfault.net",
     "https://invidious.slipfox.xyz",
-    "https://vid.puffyan.us",
+    "https://invidious.fdn.fr",
+    "https://invidious.nerdvpn.de",
+    "https://invidious.incogniweb.net",
+    "https://iv.ggtyler.dev",
+    "https://invidious.perennialte.ch",
     "https://inv.bp.projectsegfault.net",
 ]
 
@@ -135,8 +175,6 @@ def sanitize_filename(name: str) -> str:
     return ascii_clean or "media"
 
 
-import random
-
 COOKIE_FILES: List[str] = []
 
 
@@ -224,7 +262,13 @@ init_cookie_pool()
 
 
 def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
-    """Base yt-dlp options configured with cookie pool rotation."""
+    """
+    Build yt-dlp options with:
+    - Cookie pool rotation
+    - Proxy support (PROXY_URL env var)
+    - PO token support (PO_TOKEN env var)
+    - Optimal player client selection for cloud IPs
+    """
     global COOKIE_FILES
     if not COOKIE_FILES:
         init_cookie_pool()
@@ -236,38 +280,128 @@ def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
         else:
             cookie_file_path = random.choice(COOKIE_FILES)
 
-    # ── Player client strategy for cloud IPs ──────────────────────────────────
-    # tv_embedded = YouTube TV app client. Cloud IPs are NOT flagged for this
-    # client because YouTube uses it for smart TVs on ISP networks.
-    # android/ios clients are heavily flagged on datacenter IPs.
-    if cookie_file_path:
-        player_clients = ['tv_embedded', 'web_embedded', 'mweb', 'web']
+    # Client strategy based on what's available
+    if PO_TOKEN:
+        # PO token lets us use web client directly — most reliable
+        player_clients = ['web', 'tv_embedded', 'web_embedded']
+    elif cookie_file_path:
+        player_clients = ['tv_embedded', 'web_embedded', 'mweb', 'ios', 'web']
     else:
-        # No cookies — tv_embedded works without auth for public videos
+        # No cookies, no PO token — use clients least flagged on datacenter IPs
         player_clients = ['tv_embedded', 'web_embedded', 'mweb']
 
-    opts = {
+    extractor_args: dict = {
+        'youtube': {
+            'player_client': player_clients,
+        }
+    }
+
+    # Add PO token if configured
+    if PO_TOKEN:
+        extractor_args['youtube']['po_token'] = [f'web+{PO_TOKEN}']
+
+    opts: dict = {
         'quiet': True,
         'no_warnings': True,
         'socket_timeout': 30,
-        'retries': 5,
-        'fragment_retries': 5,
-        'extractor_args': {
-            'youtube': {
-                'player_client': player_clients,
-            }
-        },
+        'retries': 6,
+        'fragment_retries': 6,
+        'extractor_args': extractor_args,
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/128.0.0.0 Safari/537.36'
+            ),
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        }
+        },
+        'geo_bypass': True,
+        'geo_bypass_country': 'US',
     }
 
     if cookie_file_path:
         opts['cookiefile'] = cookie_file_path
 
+    # Apply proxy if configured
+    if PROXY_URL:
+        opts['proxy'] = PROXY_URL
+
     return opts
+
+
+def _ytdlp_extract_info(url: str) -> Optional[dict]:
+    """
+    Try yt-dlp with multiple strategies in order:
+    1. Current cookie pool + optimal clients
+    2. No cookies + tv_embedded only (bypasses cookie-related bot checks)
+    3. With proxy (if PROXY_URL set) + all clients
+    Returns None if all strategies fail with bot errors (so fallbacks can run).
+    Raises HTTPException for non-bot errors (video unavailable, etc.).
+    """
+    if not HAS_YTDLP:
+        return None
+
+    base_extract_opts = {'skip_download': True, 'extract_flat': 'in_playlist'}
+
+    strategies = []
+
+    # Strategy 1: Standard — cookies + optimal clients
+    s1 = get_base_ydl_opts()
+    s1.update(base_extract_opts)
+    strategies.append(("cookies+optimal", s1))
+
+    # Strategy 2: No cookies — tv_embedded is less flagged without credentials
+    if COOKIE_FILES:
+        s2 = get_base_ydl_opts()
+        s2.pop('cookiefile', None)
+        s2['extractor_args'] = {
+            'youtube': {'player_client': ['tv_embedded', 'web_embedded']}
+        }
+        if PO_TOKEN:
+            s2['extractor_args']['youtube']['po_token'] = [f'web+{PO_TOKEN}']
+        if PROXY_URL:
+            s2['proxy'] = PROXY_URL
+        s2.update(base_extract_opts)
+        strategies.append(("no-cookies+tv_embedded", s2))
+
+    # Strategy 3: Proxy with all clients (if proxy configured)
+    if PROXY_URL:
+        s3 = get_base_ydl_opts()
+        s3['proxy'] = PROXY_URL
+        s3['extractor_args'] = {
+            'youtube': {'player_client': ['web', 'tv_embedded', 'ios', 'android', 'mweb']}
+        }
+        if PO_TOKEN:
+            s3['extractor_args']['youtube']['po_token'] = [f'web+{PO_TOKEN}']
+        s3.update(base_extract_opts)
+        strategies.append(("proxy+all-clients", s3))
+
+    for strategy_name, opts in strategies:
+        try:
+            print(f"[yt-dlp] Trying strategy: {strategy_name}")
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            print(f"[yt-dlp] Success with strategy: {strategy_name}")
+            return info
+        except Exception as e:
+            err_msg = str(e)
+            is_bot = (
+                "Sign in to confirm" in err_msg or
+                "not a bot" in err_msg or
+                "bot" in err_msg.lower() or
+                "cookies" in err_msg.lower() or
+                "confirm your age" in err_msg.lower()
+            )
+            print(f"[yt-dlp] Strategy '{strategy_name}' failed (bot={is_bot}): {err_msg[:120]}")
+            if not is_bot:
+                # Non-bot errors should surface immediately
+                if "Video unavailable" in err_msg or "Private video" in err_msg:
+                    raise HTTPException(status_code=400, detail="This video is unavailable or private.")
+                raise HTTPException(status_code=400, detail=f"Failed to fetch details: {err_msg}")
+            continue  # Bot error — try next strategy
+
+    return None  # All strategies failed with bot errors — proceed to fallbacks
 
 
 @app.get("/api/health")
@@ -275,8 +409,10 @@ def health():
     return {
         "status": "ok",
         "engine": "yt-dlp" if HAS_YTDLP else "none",
-        "fallback_engine": "invidious" if HAS_HTTPX else "none",
+        "fallback_engine": "innertube+invidious" if HAS_HTTPX else "none",
         "cookies_loaded": len(COOKIE_FILES),
+        "proxy_configured": bool(PROXY_URL),
+        "po_token_configured": bool(PO_TOKEN),
         "message": "Downloader API is operational"
     }
 
@@ -287,10 +423,11 @@ def debug():
     results = {}
     TEST_VIDEO = "dQw4w9WgXcQ"  # Rick Astley — always public
     if HAS_HTTPX:
+        proxy_kwargs = {"proxy": PROXY_URL} if PROXY_URL else {}
         for instance in INVIDIOUS_INSTANCES:
             try:
                 url = f"{instance}/api/v1/videos/{TEST_VIDEO}?fields=title"
-                resp = httpx.get(url, timeout=8, follow_redirects=True)
+                resp = httpx.get(url, timeout=8, follow_redirects=True, **proxy_kwargs)
                 results[instance] = {
                     "status": resp.status_code,
                     "ok": resp.status_code == 200,
@@ -313,7 +450,8 @@ def debug():
         "working_instances": [k for k, v in results.items() if isinstance(v, dict) and v.get("ok")],
         "yt_dlp_version": ytdlp_version,
         "cookies_loaded": len(COOKIE_FILES),
-        "cookie_files": COOKIE_FILES,
+        "proxy_configured": bool(PROXY_URL),
+        "po_token_configured": bool(PO_TOKEN),
     }
 
 
@@ -326,15 +464,14 @@ def extract_video_id(url: str) -> Optional[str]:
 
 
 YT_INNERTUBE_CLIENTS = [
-    # Smart TV embedded player — lowest bot-detection on cloud IPs
+    # Smart TV embedded — YouTube uses for smart TVs on ISP networks, barely flagged on cloud IPs
     {
         "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
         "clientVersion": "2.0",
-        "clientScreen": "EMBED",
         "key": "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
         "user_agent": "Mozilla/5.0 (SMART-TV; LINUX; Tizen 5.5) AppleWebKit/537.36",
     },
-    # Android VR client — secondary option
+    # Android VR — headset client, very low datacenter detection
     {
         "clientName": "ANDROID_VR",
         "clientVersion": "1.56.21",
@@ -342,7 +479,7 @@ YT_INNERTUBE_CLIENTS = [
         "key": "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
         "user_agent": "com.google.android.apps.youtube.vr.oculus/1.56.21 (Linux; U; Android 12) gzip",
     },
-    # IOS Messages Extension — tertiary option
+    # iOS Messages Extension — secondary embedded client
     {
         "clientName": "IOS_MESSAGES_EXTENSION",
         "clientVersion": "19.29.1",
@@ -351,13 +488,30 @@ YT_INNERTUBE_CLIENTS = [
         "key": "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc",
         "user_agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)",
     },
+    # Android Music — rarely flagged, separate app client
+    {
+        "clientName": "ANDROID_MUSIC",
+        "clientVersion": "7.27.52",
+        "androidSdkVersion": 30,
+        "key": "AIzaSyAOghZGza2MQSZkY_zfZ370N-PUdXEo8AI",
+        "user_agent": "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 11) gzip",
+    },
+    # Web embedded player — last resort Innertube attempt
+    {
+        "clientName": "WEB_EMBEDDED_PLAYER",
+        "clientVersion": "2.20240101.00.00",
+        "key": "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    },
 ]
 
 
 def innertube_get_info(video_id: str) -> Optional[dict]:
-    """Call YouTube's own internal API (Innertube) — no cookies, minimal bot detection."""
+    """Call YouTube's internal Innertube API — no cookies, minimal bot detection."""
     if not HAS_HTTPX:
         return None
+
+    proxy_kwargs = {"proxy": PROXY_URL} if PROXY_URL else {}
 
     for client_cfg in YT_INNERTUBE_CLIENTS:
         try:
@@ -383,6 +537,8 @@ def innertube_get_info(video_id: str) -> Optional[dict]:
                 "context": {"client": ctx},
                 "racyCheckOk": True,
                 "contentCheckOk": True,
+                # PO token hint (helps on blocked IPs when configured)
+                "serviceIntegrityDimensions": {"poToken": PO_TOKEN} if PO_TOKEN else {},
             }
 
             resp = httpx.post(
@@ -391,9 +547,11 @@ def innertube_get_info(video_id: str) -> Optional[dict]:
                     "Content-Type": "application/json",
                     "User-Agent": client_cfg["user_agent"],
                     "Origin": "https://www.youtube.com",
+                    "Referer": f"https://www.youtube.com/watch?v={video_id}",
                     "X-YouTube-Client-Name": client_cfg["clientName"],
                     "X-YouTube-Client-Version": client_cfg["clientVersion"],
-                }
+                },
+                **proxy_kwargs
             )
 
             if resp.status_code != 200:
@@ -403,6 +561,7 @@ def innertube_get_info(video_id: str) -> Optional[dict]:
             data = resp.json()
             status = data.get("playabilityStatus", {}).get("status", "")
             if status == "OK":
+                print(f"Innertube success with {client_cfg['clientName']}")
                 return data
             print(f"Innertube {client_cfg['clientName']}: playabilityStatus={status}")
 
@@ -486,17 +645,25 @@ def innertube_to_response(data: dict, video_id: str) -> dict:
 
 
 def invidious_get_info(video_id: str) -> Optional[dict]:
-    """Fetch video info from Invidious API — secondary fallback."""
+    """Fetch video info from Invidious API — last cookie-free fallback."""
     if not HAS_HTTPX:
         return None
+
+    proxy_kwargs = {"proxy": PROXY_URL} if PROXY_URL else {}
     fields = "title,author,lengthSeconds,viewCount,videoThumbnails,adaptiveFormats,formatStreams"
-    for instance in INVIDIOUS_INSTANCES:
+
+    # Shuffle to avoid hammering one instance
+    shuffled = INVIDIOUS_INSTANCES.copy()
+    random.shuffle(shuffled)
+
+    for instance in shuffled:
         try:
             url = f"{instance}/api/v1/videos/{video_id}?fields={fields}"
-            resp = httpx.get(url, timeout=8, follow_redirects=True)
+            resp = httpx.get(url, timeout=8, follow_redirects=True, **proxy_kwargs)
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("title"):
+                    print(f"Invidious success: {instance}")
                     return {"_from_invidious": True, **data}
         except Exception as e:
             print(f"Invidious {instance} failed: {e}")
@@ -561,21 +728,16 @@ def get_video_info(req: VideoInfoRequest):
 
     url = clean_url(req.url)
 
+    # ── Attempt 1: yt-dlp with multi-strategy retry ───────────────────────────
     if HAS_YTDLP:
         try:
-            ydl_opts = get_base_ydl_opts()
-            ydl_opts.update({
-                'skip_download': True,
-                'extract_flat': 'in_playlist',
-            })
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                
-                # Check if this is a playlist or radio mix
+            info = _ytdlp_extract_info(url)
+            if info is not None:
+                # Playlist or radio mix
                 if info.get('_type') == 'playlist' or 'entries' in info:
                     entries = list(info.get('entries', []))
                     tracks = []
-                    for e in entries[:50]:  # Cap preview at 50 tracks
+                    for e in entries[:50]:
                         if e:
                             track_id = e.get('id')
                             tracks.append({
@@ -584,9 +746,10 @@ def get_video_info(req: VideoInfoRequest):
                                 "author": e.get('uploader') or e.get('channel', 'Unknown Artist'),
                                 "duration_formatted": format_duration(e.get('duration', 0)),
                                 "url": f"https://www.youtube.com/watch?v={track_id}",
-                                "thumbnail_url": e.get('thumbnail') or (f"https://i.ytimg.com/vi/{track_id}/hqdefault.jpg" if track_id else None)
+                                "thumbnail_url": e.get('thumbnail') or (
+                                    f"https://i.ytimg.com/vi/{track_id}/hqdefault.jpg" if track_id else None
+                                )
                             })
-                    
                     return {
                         "is_playlist": True,
                         "title": info.get('title', 'YouTube Playlist'),
@@ -596,38 +759,30 @@ def get_video_info(req: VideoInfoRequest):
                         "playlist_url": url,
                     }
 
-                # Single video extraction
+                # Single video
                 title = info.get('title', 'Unknown Title')
                 author = info.get('uploader') or info.get('channel', 'Unknown Channel')
                 duration = info.get('duration', 0)
                 views = info.get('view_count', 0)
                 thumbnail = info.get('thumbnail', '')
-                
                 raw_formats = info.get('formats', [])
-                video_streams = []
-                audio_streams = []
 
-                # Group best video formats by resolution with accurate calculated sizes
                 seen_res = set()
+                video_streams = []
                 for f in reversed(raw_formats):
                     height = f.get('height')
                     vcodec = f.get('vcodec', 'none')
-                    
                     if height and vcodec != 'none':
                         res_str = f"{height}p"
                         if res_str not in seen_res:
                             seen_res.add(res_str)
                             filesize = f.get('filesize') or f.get('filesize_approx')
                             is_approx = False
-                            
-                            # If filesize is not directly provided, calculate from bitrate & duration
                             if not filesize and duration:
                                 tbr = f.get('tbr') or f.get('vbr') or 0
-                                audio_bitrate = 192  # standard audio
                                 if tbr:
-                                    filesize = int(((tbr + audio_bitrate) * 1000 / 8) * duration)
+                                    filesize = int(((tbr + 192) * 1000 / 8) * duration)
                                     is_approx = True
-                            
                             video_streams.append({
                                 "itag": f.get('format_id'),
                                 "resolution": res_str,
@@ -639,40 +794,23 @@ def get_video_info(req: VideoInfoRequest):
                                 "has_audio": True,
                             })
 
-                # Sort video streams by resolution
                 def parse_res(item):
                     match = re.search(r'(\d+)', item.get('resolution') or '')
                     return int(match.group(1)) if match else 0
 
                 video_streams.sort(key=parse_res, reverse=True)
 
-                # Audio formats (Always MP3 with accurate size)
-                approx_audio_size = int((192 * 1000 / 8) * duration) if duration else 0
+                approx_audio = int((192 * 1000 / 8) * duration) if duration else 0
                 audio_streams = [
-                    {
-                        "itag": "bestaudio",
-                        "abr": "320kbps",
-                        "mime_type": "audio/mp3",
-                        "extension": "mp3",
-                        "filesize": int((320 * 1000 / 8) * duration) if duration else 0,
-                        "filesize_formatted": format_size(int((320 * 1000 / 8) * duration), is_approx=True) if duration else "320 kbps MP3",
-                    },
-                    {
-                        "itag": "bestaudio_192",
-                        "abr": "192kbps",
-                        "mime_type": "audio/mp3",
-                        "extension": "mp3",
-                        "filesize": approx_audio_size,
-                        "filesize_formatted": format_size(approx_audio_size, is_approx=True) if duration else "192 kbps MP3",
-                    },
-                    {
-                        "itag": "bestaudio_128",
-                        "abr": "128kbps",
-                        "mime_type": "audio/mp3",
-                        "extension": "mp3",
-                        "filesize": int((128 * 1000 / 8) * duration) if duration else 0,
-                        "filesize_formatted": format_size(int((128 * 1000 / 8) * duration), is_approx=True) if duration else "128 kbps MP3",
-                    }
+                    {"itag": "bestaudio",     "abr": "320kbps", "mime_type": "audio/mp3", "extension": "mp3",
+                     "filesize": int((320 * 1000 / 8) * duration) if duration else 0,
+                     "filesize_formatted": format_size(int((320 * 1000 / 8) * duration), is_approx=True) if duration else "320 kbps MP3"},
+                    {"itag": "bestaudio_192", "abr": "192kbps", "mime_type": "audio/mp3", "extension": "mp3",
+                     "filesize": approx_audio,
+                     "filesize_formatted": format_size(approx_audio, is_approx=True) if duration else "192 kbps MP3"},
+                    {"itag": "bestaudio_128", "abr": "128kbps", "mime_type": "audio/mp3", "extension": "mp3",
+                     "filesize": int((128 * 1000 / 8) * duration) if duration else 0,
+                     "filesize_formatted": format_size(int((128 * 1000 / 8) * duration), is_approx=True) if duration else "128 kbps MP3"},
                 ]
 
                 return {
@@ -686,43 +824,40 @@ def get_video_info(req: VideoInfoRequest):
                     "video_streams": video_streams,
                     "audio_streams": audio_streams,
                 }
+        except HTTPException:
+            raise
         except Exception as e:
-            err_msg = str(e)
-            is_bot_error = (
-                "Sign in to confirm" in err_msg or
-                "not a bot" in err_msg or
-                "bot" in err_msg.lower() or
-                "cookies" in err_msg.lower()
-            )
-            if not is_bot_error:
-                if "Video unavailable" in err_msg:
-                    raise HTTPException(status_code=400, detail="This video is unavailable or private.")
-                raise HTTPException(status_code=400, detail=f"Failed to fetch details: {err_msg}")
-            print(f"yt-dlp bot-detected, trying Innertube fallback...")
+            print(f"[yt-dlp] All strategies exhausted: {str(e)[:200]}")
+            # Fall through to cookie-free fallbacks
 
-    # ── Fallback 1: YouTube Innertube API (Smart TV client, no cookies needed) ──────
+    # ── Fallback 1: YouTube Innertube API (Smart TV / Android VR / iOS clients) ─
     if HAS_HTTPX:
         video_id = extract_video_id(url)
         if video_id:
-            print(f"Trying Innertube API for {video_id}...")
+            print(f"[innertube] Trying for {video_id}...")
             innertube_data = innertube_get_info(video_id)
             if innertube_data:
-                print(f"Innertube success!")
                 return innertube_to_response(innertube_data, video_id)
 
-            # ── Fallback 2: Invidious (public instances) ────────────────────────
-            print(f"Innertube failed, trying Invidious...")
+            # ── Fallback 2: Invidious public instances ────────────────────────
+            print(f"[invidious] Trying for {video_id}...")
             inv_data = invidious_get_info(video_id)
             if inv_data:
                 return invidious_info_to_response(inv_data, url)
 
+    # ── All engines failed — give actionable tips ─────────────────────────────
+    tips = []
+    if not PROXY_URL:
+        tips.append("Set PROXY_URL in Render → Environment Variables (residential proxy fixes this instantly)")
+    if not PO_TOKEN:
+        tips.append("Set PO_TOKEN from yt-dlp wiki (Proof of Origin token)")
+    if not COOKIE_FILES:
+        tips.append("Set YOUTUBE_COOKIES in Render → Environment Variables")
+
+    tip_str = " | ".join(tips) if tips else "All bypass methods configured — YouTube may have updated bot detection"
     raise HTTPException(
         status_code=400,
-        detail=(
-            "All engines failed to fetch video info. "
-            "YouTube is blocking this server's IP. "
-            "Please add or refresh YOUTUBE_COOKIES in Render → Environment Variables."
-        )
+        detail=f"All engines failed. YouTube is blocking this server's IP. Fix: {tip_str}"
     )
 
 
@@ -741,75 +876,115 @@ def download_stream(
         try:
             tmp_dir = tempfile.mkdtemp(prefix="ytdl_")
             out_template = os.path.join(tmp_dir, "%(title)s.%(ext)s")
-
             has_ffmpeg = bool(shutil.which('ffmpeg'))
-            ydl_opts = get_base_ydl_opts()
-            ydl_opts.update({
-                'outtmpl': out_template,
-            })
 
-            if audio_only:
-                ydl_opts['format'] = 'bestaudio/best'
-                if has_ffmpeg:
-                    ydl_opts['postprocessors'] = [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '192',
-                    }]
-            else:
-                if has_ffmpeg:
-                    fmt = f"{itag}+bestaudio/best" if itag.isdigit() else "bestvideo+bestaudio/best/best"
-                else:
-                    fmt = f"{itag}/bestvideo+bestaudio/best"
-                ydl_opts['format'] = fmt
-
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                downloaded_file = ydl.prepare_filename(info)
-                
-                # If audio was converted to MP3, check for .mp3 extension
+            # Build download format string
+            def _build_fmt(ydl_opts_: dict):
                 if audio_only:
-                    base_name = os.path.splitext(downloaded_file)[0]
-                    mp3_path = base_name + ".mp3"
-                    if os.path.exists(mp3_path):
-                        downloaded_file = mp3_path
-
-                if not os.path.exists(downloaded_file):
-                    files = os.listdir(tmp_dir)
-                    if files:
-                        downloaded_file = os.path.join(tmp_dir, files[0])
+                    ydl_opts_['format'] = 'bestaudio/best'
+                    if has_ffmpeg:
+                        ydl_opts_['postprocessors'] = [{
+                            'key': 'FFmpegExtractAudio',
+                            'preferredcodec': 'mp3',
+                            'preferredquality': '192',
+                        }]
+                else:
+                    if has_ffmpeg:
+                        fmt = f"{itag}+bestaudio/best" if itag.isdigit() else "bestvideo+bestaudio/best/best"
                     else:
-                        raise HTTPException(status_code=500, detail="Downloaded file was not found on server.")
+                        fmt = f"{itag}/bestvideo+bestaudio/best"
+                    ydl_opts_['format'] = fmt
 
-                safe_title = sanitize_filename(info.get('title', 'video'))
-                ext = "mp3" if audio_only else (os.path.splitext(downloaded_file)[1].lstrip('.') or 'mp4')
-                raw_filename = f"{info.get('title', 'video')}.{ext}"
-                ascii_filename = f"{safe_title}.{ext}"
-                utf8_encoded_filename = urllib.parse.quote(raw_filename)
-                filesize = os.path.getsize(downloaded_file)
+            # Multi-strategy download
+            strategies_dl = []
 
-                def iterfile():
+            s1 = get_base_ydl_opts()
+            s1['outtmpl'] = out_template
+            _build_fmt(s1)
+            strategies_dl.append(("cookies+optimal", s1))
+
+            if COOKIE_FILES:
+                s2 = get_base_ydl_opts()
+                s2.pop('cookiefile', None)
+                s2['outtmpl'] = out_template
+                s2['extractor_args'] = {'youtube': {'player_client': ['tv_embedded', 'web_embedded']}}
+                if PROXY_URL:
+                    s2['proxy'] = PROXY_URL
+                _build_fmt(s2)
+                strategies_dl.append(("no-cookies+tv_embedded", s2))
+
+            if PROXY_URL:
+                s3 = get_base_ydl_opts()
+                s3['proxy'] = PROXY_URL
+                s3['outtmpl'] = out_template
+                s3['extractor_args'] = {'youtube': {'player_client': ['web', 'tv_embedded', 'ios', 'android']}}
+                _build_fmt(s3)
+                strategies_dl.append(("proxy+all-clients", s3))
+
+            info = None
+            downloaded_file = None
+
+            for strategy_name, ydl_opts in strategies_dl:
+                try:
+                    print(f"[download] Trying strategy: {strategy_name}")
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                        downloaded_file = ydl.prepare_filename(info)
+
+                    if audio_only:
+                        base_name = os.path.splitext(downloaded_file)[0]
+                        mp3_path = base_name + ".mp3"
+                        if os.path.exists(mp3_path):
+                            downloaded_file = mp3_path
+
+                    if not os.path.exists(downloaded_file):
+                        files = os.listdir(tmp_dir)
+                        downloaded_file = os.path.join(tmp_dir, files[0]) if files else None
+
+                    if downloaded_file and os.path.exists(downloaded_file):
+                        print(f"[download] Success with strategy: {strategy_name}")
+                        break
+
+                except Exception as e:
+                    err_msg = str(e)
+                    is_bot = (
+                        "Sign in to confirm" in err_msg or "bot" in err_msg.lower() or
+                        "cookies" in err_msg.lower()
+                    )
+                    print(f"[download] Strategy '{strategy_name}' failed (bot={is_bot}): {err_msg[:120]}")
+                    if not is_bot:
+                        raise HTTPException(status_code=400, detail=f"Download failed: {err_msg}")
+                    continue
+
+            if not downloaded_file or not os.path.exists(downloaded_file):
+                raise HTTPException(status_code=500, detail="Downloaded file was not found on server.")
+
+            safe_title = sanitize_filename(info.get('title', 'video') if info else 'video')
+            ext = "mp3" if audio_only else (os.path.splitext(downloaded_file)[1].lstrip('.') or 'mp4')
+            raw_filename = f"{(info.get('title', 'video') if info else 'video')}.{ext}"
+            ascii_filename = f"{safe_title}.{ext}"
+            utf8_encoded_filename = urllib.parse.quote(raw_filename)
+            filesize = os.path.getsize(downloaded_file)
+
+            def iterfile():
+                try:
+                    with open(downloaded_file, mode="rb") as f:
+                        while chunk := f.read(1024 * 256):
+                            yield chunk
+                finally:
                     try:
-                        with open(downloaded_file, mode="rb") as f:
-                            while chunk := f.read(1024 * 256):  # 256KB chunks
-                                yield chunk
-                    finally:
-                        try:
-                            if os.path.exists(downloaded_file):
-                                os.remove(downloaded_file)
-                            if os.path.exists(tmp_dir):
-                                os.rmdir(tmp_dir)
-                        except Exception:
-                            pass
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                    except Exception:
+                        pass
 
-                headers = {
-                    "Content-Disposition": f'attachment; filename="{ascii_filename}"; filename*=UTF-8\'\'{utf8_encoded_filename}',
-                    "Content-Length": str(filesize),
-                    "Access-Control-Expose-Headers": "Content-Disposition, Content-Length",
-                }
+            headers = {
+                "Content-Disposition": f'attachment; filename="{ascii_filename}"; filename*=UTF-8\'\'{utf8_encoded_filename}',
+                "Content-Length": str(filesize),
+                "Access-Control-Expose-Headers": "Content-Disposition, Content-Length",
+            }
 
-                mime_type = "audio/mpeg" if audio_only else f"video/{ext}"
-                return StreamingResponse(iterfile(), headers=headers, media_type=mime_type)
+            mime_type = "audio/mpeg" if audio_only else f"video/{ext}"
+            return StreamingResponse(iterfile(), headers=headers, media_type=mime_type)
 
         except HTTPException:
             raise
