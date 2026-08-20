@@ -11,6 +11,8 @@ import zipfile
 import shutil
 import urllib.parse
 import subprocess
+import queue
+import threading
 from typing import Optional, List, Dict
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -104,8 +106,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory store for generated zip files waiting to be downloaded
+# In-memory store for generated zip files and single download files
 ZIP_STORAGE: Dict[str, Dict] = {}
+SINGLE_FILE_STORAGE: Dict[str, Dict] = {}
 
 
 class VideoInfoRequest(BaseModel):
@@ -858,6 +861,210 @@ def get_video_info(req: VideoInfoRequest):
     )
 
 
+
+
+@app.get("/api/download-single-sse")
+def download_single_sse(
+    url: str = Query(..., description="YouTube video URL"),
+    itag: str = Query(..., description="Selected stream itag or format_id"),
+    audio_only: bool = Query(False, description="Whether to download audio only")
+):
+    """
+    Live SSE single video/audio download engine:
+    Emits real-time progress events from the server to the frontend, converts audio/merges video,
+    and returns a file_id ready for instantaneous browser transfer.
+    """
+    clean_target_url = clean_url(url)
+
+    def event_stream():
+        tmp_dir = tempfile.mkdtemp(prefix="ytdl_sse_single_")
+        out_template = os.path.join(tmp_dir, "%(title)s.%(ext)s")
+        has_ffmpeg = bool(shutil.which('ffmpeg'))
+        msg_queue = queue.Queue()
+
+        yield f"data: {json.dumps({'type': 'init', 'percent': 5, 'speed': 'Connecting...', 'eta': 'Calculating...', 'status': 'Connecting to YouTube stream...'})}\n\n"
+
+        def _build_fmt(ydl_opts_: dict):
+            if audio_only:
+                ydl_opts_['format'] = 'bestaudio/best'
+                if has_ffmpeg:
+                    ydl_opts_['postprocessors'] = [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '192',
+                    }]
+            else:
+                if itag.isdigit():
+                    fmt = f"{itag}+bestaudio/best/{itag}/best" if has_ffmpeg else f"{itag}/best"
+                elif itag in ["1080p", "720p", "480p", "360p", "240p", "144p"]:
+                    height_val = itag.replace("p", "")
+                    fmt = f"bestvideo[height<={height_val}]+bestaudio/best[height<={height_val}]/best" if has_ffmpeg else f"best[height<={height_val}]/best"
+                else:
+                    fmt = "bestvideo+bestaudio/best" if has_ffmpeg else "best"
+                ydl_opts_['format'] = fmt
+
+        def progress_hook(d):
+            status = d.get('status')
+            if status == 'downloading':
+                total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+                downloaded = d.get('downloaded_bytes', 0)
+                speed = d.get('speed') or 0
+                eta = d.get('eta') or 0
+
+                pct = min(88, max(5, int((downloaded / total) * 88))) if total else 25
+
+                if speed >= 1024 * 1024:
+                    speed_str = f"{speed / (1024 * 1024):.1f} MB/s"
+                elif speed > 0:
+                    speed_str = f"{speed / 1024:.0f} KB/s"
+                else:
+                    speed_str = "Downloading..."
+
+                eta_str = f"~{int(eta)}s left" if eta else "Calculating..."
+                down_mb = f"{downloaded / (1024 * 1024):.1f}"
+                tot_mb = f"{total / (1024 * 1024):.1f}" if total else ""
+
+                msg_queue.put({
+                    'type': 'progress',
+                    'percent': pct,
+                    'receivedMB': down_mb,
+                    'totalMB': tot_mb,
+                    'speed': speed_str,
+                    'eta': eta_str,
+                    'status': '⚡ Downloading high-speed stream...' if not audio_only else '⚡ Downloading audio stream...',
+                })
+            elif status == 'finished':
+                msg_queue.put({
+                    'type': 'converting',
+                    'percent': 92,
+                    'speed': 'Processing',
+                    'eta': 'Almost done',
+                    'status': '✨ Converting to high-bitrate MP3...' if audio_only else '✨ Finalizing & packaging video...'
+                })
+
+        def worker():
+            try:
+                strategies_dl = []
+                s1 = get_base_ydl_opts()
+                s1['outtmpl'] = out_template
+                s1['progress_hooks'] = [progress_hook]
+                _build_fmt(s1)
+                strategies_dl.append(("primary", s1))
+
+                if COOKIE_FILES:
+                    s2 = get_base_ydl_opts()
+                    s2.pop('cookiefile', None)
+                    s2['outtmpl'] = out_template
+                    s2['progress_hooks'] = [progress_hook]
+                    if PROXY_URL:
+                        s2['proxy'] = PROXY_URL
+                    _build_fmt(s2)
+                    strategies_dl.append(("no-cookie-fallback", s2))
+
+                info_res = None
+                dl_file = None
+                for strat_name, opts in strategies_dl:
+                    try:
+                        with yt_dlp.YoutubeDL(opts) as ydl:
+                            info_res = ydl.extract_info(clean_target_url, download=True)
+                            dl_file = ydl.prepare_filename(info_res)
+
+                        if audio_only:
+                            base_name = os.path.splitext(dl_file)[0]
+                            mp3_path = base_name + ".mp3"
+                            if os.path.exists(mp3_path):
+                                dl_file = mp3_path
+
+                        if not os.path.exists(dl_file):
+                            files = os.listdir(tmp_dir)
+                            dl_file = os.path.join(tmp_dir, files[0]) if files else None
+
+                        if dl_file and os.path.exists(dl_file):
+                            break
+                    except Exception as e:
+                        print(f"[single-sse] Strategy {strat_name} failed: {e}")
+                        continue
+
+                if not dl_file or not os.path.exists(dl_file):
+                    msg_queue.put({'type': 'error', 'message': 'Download failed: Output file not created.'})
+                    return
+
+                msg_queue.put({'type': 'done', 'file_path': dl_file, 'info': info_res})
+            except Exception as e:
+                msg_queue.put({'type': 'error', 'message': str(e)})
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+        while t.is_alive() or not msg_queue.empty():
+            try:
+                msg = msg_queue.get(timeout=0.25)
+                mtype = msg.get('type')
+                if mtype == 'done':
+                    dl_file = msg['file_path']
+                    info_res = msg.get('info') or {}
+                    raw_title = info_res.get('title', 'media')
+                    safe_title = sanitize_filename(raw_title)
+                    ext = "mp3" if audio_only else (os.path.splitext(dl_file)[1].lstrip('.') or 'mp4')
+                    final_filename = f"{safe_title}.{ext}"
+                    filesize = os.path.getsize(dl_file)
+
+                    file_id = str(uuid.uuid4())
+                    SINGLE_FILE_STORAGE[file_id] = {
+                        'path': dl_file,
+                        'tmp_dir': tmp_dir,
+                        'filename': final_filename,
+                        'size': filesize,
+                        'created_at': time.time(),
+                    }
+
+                    yield f"data: {json.dumps({'type': 'complete', 'percent': 100, 'file_id': file_id, 'filename': final_filename, 'size_formatted': format_size(filesize), 'status': '🎉 Download Complete!'})}\n\n"
+                    return
+                elif mtype == 'error':
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    yield f"data: {json.dumps({'type': 'error', 'message': msg.get('message', 'Download error')})}\n\n"
+                    return
+                else:
+                    yield f"data: {json.dumps(msg)}\n\n"
+            except queue.Empty:
+                pass
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/api/get-single-file")
+def get_single_file(file_id: str = Query(...)):
+    """Serve the downloaded single video/audio file and clean up temp folder."""
+    item = SINGLE_FILE_STORAGE.pop(file_id, None)
+    if not item or not os.path.exists(item['path']):
+        raise HTTPException(status_code=404, detail="File expired or not found.")
+
+    file_path = item['path']
+    tmp_dir = item['tmp_dir']
+    filename = item['filename']
+    filesize = item['size']
+
+    def iterfile():
+        try:
+            with open(file_path, mode="rb") as f:
+                while chunk := f.read(1024 * 256):
+                    yield chunk
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    safe_ascii = sanitize_filename(os.path.splitext(filename)[0]) + os.path.splitext(filename)[1]
+    utf8_encoded = urllib.parse.quote(filename)
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{safe_ascii}"; filename*=UTF-8\'\'{utf8_encoded}',
+        "Content-Length": str(filesize),
+        "Access-Control-Expose-Headers": "Content-Disposition, Content-Length",
+    }
+    ext = os.path.splitext(filename)[1].lstrip('.').lower()
+    mime = "audio/mpeg" if ext == "mp3" else f"video/{ext}"
+    return StreamingResponse(iterfile(), headers=headers, media_type=mime)
 
 
 @app.get("/api/download")

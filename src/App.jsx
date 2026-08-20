@@ -148,22 +148,22 @@ export default function App() {
     setDownloading(true);
     setDownloadSuccess(false);
     setDownloadProgress({
-      percent: 0,
+      percent: 5,
       receivedMB: '0',
-      totalMB: '',
+      totalMB: selectedStream.filesize ? (selectedStream.filesize / (1024 * 1024)).toFixed(1) : '',
       speed: 'Connecting...',
       eta: 'Calculating...',
-      status: 'Connecting to YouTube stream...',
+      status: '⚡ Connecting to YouTube stream...',
     });
     setError('');
 
     try {
       const isAudio = !selectedStream.resolution;
-      const downloadUrl = `/api/download?url=${encodeURIComponent(url.trim())}&itag=${selectedStream.itag}&audio_only=${isAudio}`;
+      const downloadSseUrl = `/api/download-single-sse?url=${encodeURIComponent(url.trim())}&itag=${selectedStream.itag}&audio_only=${isAudio}`;
 
-      const response = await fetch(downloadUrl, { signal: controller.signal });
+      const response = await fetch(downloadSseUrl, { signal: controller.signal });
       if (!response.ok) {
-        let errText = 'Download failed.';
+        let errText = 'Download failed to initialize.';
         try {
           const errJson = await response.json();
           errText = errJson.detail || errText;
@@ -173,83 +173,75 @@ export default function App() {
         throw new Error(errText);
       }
 
-      const contentLength = response.headers.get('Content-Length');
-      const totalBytes = contentLength ? parseInt(contentLength, 10) : (selectedStream.filesize || 0);
-      const mbTotal = totalBytes > 0 ? (totalBytes / (1024 * 1024)).toFixed(1) : '';
-
-      let receivedBytes = 0;
       const reader = response.body.getReader();
-      const chunks = [];
-
-      let startTime = performance.now();
-      let lastSpeedCalcTime = startTime;
-      let lastSpeedBytes = 0;
-      let currentSpeed = '0 MB/s';
-      let currentEta = 'Calculating...';
+      const decoder = new TextDecoder();
+      let buffer = '';
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        chunks.push(value);
-        receivedBytes += value.length;
 
-        const now = performance.now();
-        const timeDiff = (now - lastSpeedCalcTime) / 1000;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n\n');
+        buffer = lines.pop() || '';
 
-        // Update speed and ETA every 350ms
-        if (timeDiff >= 0.35) {
-          const bytesDiff = receivedBytes - lastSpeedBytes;
-          const bytesPerSec = bytesDiff / timeDiff;
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const jsonStr = trimmed.replace(/^data:\s*/, '');
+          try {
+            const data = JSON.parse(jsonStr);
 
-          if (bytesPerSec >= 1024 * 1024) {
-            currentSpeed = `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
-          } else {
-            currentSpeed = `${(bytesPerSec / 1024).toFixed(0)} KB/s`;
-          }
+            if (data.type === 'progress') {
+              setDownloadProgress(prev => ({
+                ...prev,
+                percent: data.percent || prev.percent,
+                receivedMB: data.receivedMB || prev.receivedMB,
+                totalMB: data.totalMB || prev.totalMB,
+                speed: data.speed || prev.speed,
+                eta: data.eta || prev.eta,
+                status: data.status || prev.status,
+              }));
+            } else if (data.type === 'converting') {
+              setDownloadProgress(prev => ({
+                ...prev,
+                percent: data.percent || 92,
+                speed: data.speed || 'Processing',
+                eta: data.eta || 'Few seconds',
+                status: data.status || '✨ Converting / Packaging stream...',
+              }));
+            } else if (data.type === 'complete') {
+              setDownloadProgress({
+                percent: 100,
+                receivedMB: data.size_formatted || '',
+                totalMB: data.size_formatted || '',
+                speed: 'Finished',
+                eta: '0s',
+                status: '🎉 Download complete! Starting browser download...',
+              });
 
-          if (totalBytes > 0 && bytesPerSec > 0) {
-            const remainingBytes = Math.max(0, totalBytes - receivedBytes);
-            const remainingSec = Math.ceil(remainingBytes / bytesPerSec);
-            if (remainingSec >= 60) {
-              currentEta = `~${Math.floor(remainingSec / 60)}m ${remainingSec % 60}s`;
-            } else {
-              currentEta = `~${remainingSec}s left`;
+              // Trigger native browser download directly
+              const fileUrl = `/api/get-single-file?file_id=${data.file_id}`;
+              const a = document.createElement('a');
+              a.href = fileUrl;
+              a.download = data.filename || 'media';
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+
+              setDownloadSuccess(true);
+              setDownloading(false);
+              return;
+            } else if (data.type === 'error') {
+              throw new Error(data.message || 'Download failed on server.');
+            }
+          } catch (pe) {
+            if (pe.message && !pe.message.includes('JSON')) {
+              throw pe;
             }
           }
-
-          lastSpeedCalcTime = now;
-          lastSpeedBytes = receivedBytes;
         }
-
-        const mbReceived = (receivedBytes / (1024 * 1024)).toFixed(1);
-        const percent = totalBytes > 0 ? Math.min(100, Math.round((receivedBytes / totalBytes) * 100)) : 0;
-
-        setDownloadProgress({
-          percent,
-          receivedMB: mbReceived,
-          totalMB: mbTotal,
-          speed: currentSpeed,
-          eta: currentEta,
-          status: isAudio ? 'Converting & Downloading genuine MP3...' : 'Downloading Video Stream...',
-        });
       }
-
-      // Create Blob and trigger file download
-      const blob = new Blob(chunks, {
-        type: isAudio ? 'audio/mpeg' : (selectedStream.mime_type || 'video/mp4'),
-      });
-      const blobUrl = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = blobUrl;
-      const ext = isAudio ? 'mp3' : (selectedStream.extension || 'mp4');
-      const cleanTitle = (videoInfo.title || 'video').replace(/[\\/*?:"<>|]/g, '');
-      a.download = `${cleanTitle}.${ext}`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      window.URL.revokeObjectURL(blobUrl);
-
-      setDownloadSuccess(true);
     } catch (err) {
       if (err.name === 'AbortError') {
         console.log('Download cancelled by user.');
@@ -257,8 +249,8 @@ export default function App() {
         console.error('Download error:', err);
         setError(err.message || 'Could not complete download.');
       }
-    } finally {
       setDownloading(false);
+    } finally {
       setDownloadController(null);
     }
   };
