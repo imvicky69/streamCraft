@@ -1,0 +1,25 @@
+{
+  "name": "StreamCraft - YouTube & Music Downloader",
+  "short_name": "StreamCraft",
+  "description": "Download YouTube videos, shorts, and YouTube Music playlists as MP4 or MP3 directly in your browser.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0c0e14",
+  "theme_color": "#0c0e14",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/logo.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["utilities", "music", "video"]
+}
