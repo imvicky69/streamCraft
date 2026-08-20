@@ -707,6 +707,72 @@ async def get_single_file(file_id: str = Query(...)):
     )
 
 
+# ── Endpoint: Direct Single Download (Vercel 502/504 Fallback) ────────────────
+@app.get("/api/download-direct")
+async def download_direct(
+    url: str = Query(...),
+    itag: str = Query(...),
+    audio_only: bool = Query(False)
+):
+    """Direct one-step download endpoint without SSE, ideal for edge/Vercel proxies and direct browser downloads."""
+    cleanup_old_files()
+    raw_url = clean_url(url)
+    temp_dir = tempfile.mkdtemp(prefix="streamcraft_direct_")
+
+    ydl_opts = get_base_ydl_opts({
+        "outtmpl": os.path.join(temp_dir, "%(title).200B.%(ext)s"),
+        "noplaylist": True,
+    })
+
+    if audio_only:
+        bitrate_match = re.search(r"(\d+)k?", itag)
+        desired_bitrate = bitrate_match.group(1) if bitrate_match else "192"
+        ydl_opts.update({
+            "format": "bestaudio/best",
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": desired_bitrate,
+            }],
+        })
+    else:
+        if itag and itag.isdigit():
+            ydl_opts["format"] = f"{itag}+bestaudio/bestvideo+bestaudio/best"
+        else:
+            ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        ydl_opts["merge_output_format"] = "mp4"
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info_dict = ydl.extract_info(raw_url, download=True)
+            title = info_dict.get("title", "media") if info_dict else "media"
+
+        downloaded_files = [
+            os.path.join(temp_dir, f) for f in os.listdir(temp_dir)
+            if not f.endswith(".part") and not f.endswith(".ytdl")
+        ]
+        if not downloaded_files:
+            raise RuntimeError("Media file was not generated.")
+
+        final_filepath = downloaded_files[0]
+        ext = os.path.splitext(final_filepath)[1].lstrip(".").lower() or ("mp3" if audio_only else "mp4")
+        safe_title = sanitize_filename(title)
+        final_filename = f"{safe_title}.{ext}"
+        safe_header_name = urllib.parse.quote(final_filename)
+
+        return FileResponse(
+            path=final_filepath,
+            filename=final_filename,
+            media_type="audio/mpeg" if ext == "mp3" else "video/mp4",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{safe_header_name}"
+            }
+        )
+    except Exception as e:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Direct download failed: {str(e)}")
+
+
 # ── Endpoint: Cancel Download ─────────────────────────────────────────────────
 @app.post("/api/cancel-download")
 async def cancel_download(download_id: str = Query(...)):

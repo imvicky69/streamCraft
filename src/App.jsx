@@ -211,6 +211,29 @@ export default function App() {
 
       const response = await fetch(downloadSseUrl, { signal: controller.signal });
       if (!response.ok) {
+        if (response.status === 502 || response.status === 504) {
+          // Vercel / Edge proxy timeout -> Fallback directly to browser one-click stream download!
+          console.warn('Vercel 502 proxy detected on SSE. Switching to direct download mode...');
+          setDownloadProgress(prev => ({
+            ...prev,
+            percent: 90,
+            status: '⚡ Downloading directly from server...',
+          }));
+
+          const directUrl = `/api/download-direct?url=${encodeURIComponent(url.trim())}&itag=${selectedStream.itag}&audio_only=${isAudio}`;
+          const cleanTitle = (videoInfo.title || 'media').replace(/[\\/*?:"<>|]/g, '');
+          const a = document.createElement('a');
+          a.href = directUrl;
+          a.download = `${cleanTitle}.${isAudio ? 'mp3' : 'mp4'}`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+
+          setDownloadSuccess(true);
+          setDownloading(false);
+          return;
+        }
+
         let errText = 'Download failed to initialize.';
         try {
           const errJson = await response.json();
