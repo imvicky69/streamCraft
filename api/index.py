@@ -14,7 +14,7 @@ import subprocess
 import queue
 import threading
 from typing import Optional, List, Dict
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
@@ -109,6 +109,12 @@ app.add_middleware(
 # In-memory store for generated zip files and single download files
 ZIP_STORAGE: Dict[str, Dict] = {}
 SINGLE_FILE_STORAGE: Dict[str, Dict] = {}
+
+# In-memory LRU metadata cache (URL -> (timestamp, response_data)) to make info analysis instant (0.01s)
+INFO_CACHE: Dict[str, tuple] = {}
+
+# Active downloads tracking for instantaneous cancellation
+ACTIVE_DOWNLOADS: Dict[str, threading.Event] = {}
 
 
 class VideoInfoRequest(BaseModel):
@@ -705,7 +711,28 @@ def get_video_info(req: VideoInfoRequest):
 
     url = clean_url(req.url)
 
-    # ── Attempt 1: yt-dlp with multi-strategy retry ───────────────────────────
+    # 1. In-Memory Cache check (Instant 0.001s response for repeated/retried URLs)
+    now = time.time()
+    if url in INFO_CACHE:
+        cached_time, cached_data = INFO_CACHE[url]
+        if now - cached_time < 900:  # 15 minutes TTL
+            print(f"[cache] Instant response for {url}")
+            return cached_data
+
+    is_playlist = ('list=' in url and 'watch?v=' not in url) or ('playlist?list=' in url)
+
+    # 2. Fast-Path for Single Videos: Innertube (~300ms ultra-fast response)
+    if not is_playlist and HAS_HTTPX:
+        video_id = extract_video_id(url)
+        if video_id:
+            print(f"[fast-path] Trying Innertube for {video_id}...")
+            innertube_data = innertube_get_info(video_id)
+            if innertube_data:
+                res = innertube_to_response(innertube_data, video_id)
+                INFO_CACHE[url] = (now, res)
+                return res
+
+    # 3. Comprehensive Path: yt-dlp (handles playlists, restricted streams, etc.)
     if HAS_YTDLP:
         try:
             info = _ytdlp_extract_info(url)
@@ -727,7 +754,7 @@ def get_video_info(req: VideoInfoRequest):
                                     f"https://i.ytimg.com/vi/{track_id}/hqdefault.jpg" if track_id else None
                                 )
                             })
-                    return {
+                    res = {
                         "is_playlist": True,
                         "title": info.get('title', 'YouTube Playlist'),
                         "author": info.get('uploader') or 'YouTube / YouTube Music',
@@ -735,6 +762,8 @@ def get_video_info(req: VideoInfoRequest):
                         "tracks": tracks,
                         "playlist_url": url,
                     }
+                    INFO_CACHE[url] = (now, res)
+                    return res
 
                 # Single video
                 title = info.get('title', 'Unknown Title')
@@ -813,7 +842,7 @@ def get_video_info(req: VideoInfoRequest):
                      "filesize_formatted": format_size(int((128 * 1000 / 8) * duration), is_approx=True) if duration else "128 kbps MP3"},
                 ]
 
-                return {
+                res = {
                     "is_playlist": False,
                     "title": title,
                     "author": author,
@@ -824,26 +853,23 @@ def get_video_info(req: VideoInfoRequest):
                     "video_streams": video_streams,
                     "audio_streams": audio_streams,
                 }
+                INFO_CACHE[url] = (now, res)
+                return res
         except HTTPException:
             raise
         except Exception as e:
             print(f"[yt-dlp] All strategies exhausted: {str(e)[:200]}")
-            # Fall through to cookie-free fallbacks
 
-    # ── Fallback 1: YouTube Innertube API (Smart TV / Android VR / iOS clients) ─
+    # 4. Fallback: Invidious public instances
     if HAS_HTTPX:
         video_id = extract_video_id(url)
         if video_id:
-            print(f"[innertube] Trying for {video_id}...")
-            innertube_data = innertube_get_info(video_id)
-            if innertube_data:
-                return innertube_to_response(innertube_data, video_id)
-
-            # ── Fallback 2: Invidious public instances ────────────────────────
             print(f"[invidious] Trying for {video_id}...")
             inv_data = invidious_get_info(video_id)
             if inv_data:
-                return invidious_info_to_response(inv_data, url)
+                res = invidious_info_to_response(inv_data, url)
+                INFO_CACHE[url] = (now, res)
+                return res
 
     # ── All engines failed — give actionable tips ─────────────────────────────
     tips = []
@@ -864,19 +890,25 @@ def get_video_info(req: VideoInfoRequest):
 
 
 @app.get("/api/download-single-sse")
-def download_single_sse(
+async def download_single_sse(
+    request: Request,
     url: str = Query(..., description="YouTube video URL"),
     itag: str = Query(..., description="Selected stream itag or format_id"),
-    audio_only: bool = Query(False, description="Whether to download audio only")
+    audio_only: bool = Query(False, description="Whether to download audio only"),
+    download_id: Optional[str] = Query(None, description="Unique download session identifier")
 ):
     """
     Live SSE single video/audio download engine:
     Emits real-time progress events from the server to the frontend, converts audio/merges video,
     and returns a file_id ready for instantaneous browser transfer.
+    Instantly cancels background download process if client aborts or disconnects.
     """
     clean_target_url = clean_url(url)
+    cancel_event = threading.Event()
+    if download_id:
+        ACTIVE_DOWNLOADS[download_id] = cancel_event
 
-    def event_stream():
+    async def event_stream():
         tmp_dir = tempfile.mkdtemp(prefix="ytdl_sse_single_")
         out_template = os.path.join(tmp_dir, "%(title)s.%(ext)s")
         has_ffmpeg = bool(shutil.which('ffmpeg'))
@@ -904,6 +936,9 @@ def download_single_sse(
                 ydl_opts_['format'] = fmt
 
         def progress_hook(d):
+            if cancel_event.is_set():
+                raise Exception("Download aborted by user")
+
             status = d.get('status')
             if status == 'downloading':
                 total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
@@ -964,6 +999,8 @@ def download_single_sse(
                 info_res = None
                 dl_file = None
                 for strat_name, opts in strategies_dl:
+                    if cancel_event.is_set():
+                        return
                     try:
                         with yt_dlp.YoutubeDL(opts) as ydl:
                             info_res = ydl.extract_info(clean_target_url, download=True)
@@ -982,8 +1019,14 @@ def download_single_sse(
                         if dl_file and os.path.exists(dl_file):
                             break
                     except Exception as e:
+                        if cancel_event.is_set() or "aborted" in str(e).lower() or "cancelled" in str(e).lower():
+                            print(f"[single-sse] Backend download gracefully cancelled.")
+                            return
                         print(f"[single-sse] Strategy {strat_name} failed: {e}")
                         continue
+
+                if cancel_event.is_set():
+                    return
 
                 if not dl_file or not os.path.exists(dl_file):
                     msg_queue.put({'type': 'error', 'message': 'Download failed: Output file not created.'})
@@ -991,47 +1034,74 @@ def download_single_sse(
 
                 msg_queue.put({'type': 'done', 'file_path': dl_file, 'info': info_res})
             except Exception as e:
-                msg_queue.put({'type': 'error', 'message': str(e)})
+                if not cancel_event.is_set():
+                    msg_queue.put({'type': 'error', 'message': str(e)})
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
 
-        while t.is_alive() or not msg_queue.empty():
-            try:
-                msg = msg_queue.get(timeout=0.25)
-                mtype = msg.get('type')
-                if mtype == 'done':
-                    dl_file = msg['file_path']
-                    info_res = msg.get('info') or {}
-                    raw_title = info_res.get('title', 'media')
-                    safe_title = sanitize_filename(raw_title)
-                    ext = "mp3" if audio_only else (os.path.splitext(dl_file)[1].lstrip('.') or 'mp4')
-                    final_filename = f"{safe_title}.{ext}"
-                    filesize = os.path.getsize(dl_file)
-
-                    file_id = str(uuid.uuid4())
-                    SINGLE_FILE_STORAGE[file_id] = {
-                        'path': dl_file,
-                        'tmp_dir': tmp_dir,
-                        'filename': final_filename,
-                        'size': filesize,
-                        'created_at': time.time(),
-                    }
-
-                    yield f"data: {json.dumps({'type': 'complete', 'percent': 100, 'file_id': file_id, 'filename': final_filename, 'size_formatted': format_size(filesize), 'status': '🎉 Download Complete!'})}\n\n"
-                    return
-                elif mtype == 'error':
+        try:
+            while t.is_alive() or not msg_queue.empty():
+                if await request.is_disconnected():
+                    print("[sse] Client disconnected. Halting background download immediately...")
+                    cancel_event.set()
                     shutil.rmtree(tmp_dir, ignore_errors=True)
-                    yield f"data: {json.dumps({'type': 'error', 'message': msg.get('message', 'Download error')})}\n\n"
+                    if download_id:
+                        ACTIVE_DOWNLOADS.pop(download_id, None)
                     return
-                else:
-                    yield f"data: {json.dumps(msg)}\n\n"
-            except queue.Empty:
-                pass
 
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+                try:
+                    msg = msg_queue.get(timeout=0.2)
+                    mtype = msg.get('type')
+                    if mtype == 'done':
+                        dl_file = msg['file_path']
+                        info_res = msg.get('info') or {}
+                        raw_title = info_res.get('title', 'media')
+                        safe_title = sanitize_filename(raw_title)
+                        ext = "mp3" if audio_only else (os.path.splitext(dl_file)[1].lstrip('.') or 'mp4')
+                        final_filename = f"{safe_title}.{ext}"
+                        filesize = os.path.getsize(dl_file)
+
+                        file_id = str(uuid.uuid4())
+                        SINGLE_FILE_STORAGE[file_id] = {
+                            'path': dl_file,
+                            'tmp_dir': tmp_dir,
+                            'filename': final_filename,
+                            'size': filesize,
+                            'created_at': time.time(),
+                        }
+
+                        yield f"data: {json.dumps({'type': 'complete', 'percent': 100, 'file_id': file_id, 'filename': final_filename, 'size_formatted': format_size(filesize), 'status': '🎉 Download Complete!'})}\n\n"
+                        if download_id:
+                            ACTIVE_DOWNLOADS.pop(download_id, None)
+                        return
+                    elif mtype == 'error':
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                        yield f"data: {json.dumps({'type': 'error', 'message': msg.get('message', 'Download error')})}\n\n"
+                        if download_id:
+                            ACTIVE_DOWNLOADS.pop(download_id, None)
+                        return
+                    else:
+                        yield f"data: {json.dumps(msg)}\n\n"
+                except queue.Empty:
+                    pass
+        finally:
+            if cancel_event.is_set():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            if download_id:
+                ACTIVE_DOWNLOADS.pop(download_id, None)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.post("/api/cancel-download")
+def cancel_download(download_id: str = Query(...)):
+    """Explicitly terminate an active download session on the server and clean up disk."""
+    event = ACTIVE_DOWNLOADS.pop(download_id, None)
+    if event:
+        event.set()
+        return {"status": "ok", "message": "Download cancelled and backend process terminated"}
+    return {"status": "ok", "message": "Session not active or already completed"}
 
 
 @app.get("/api/get-single-file")

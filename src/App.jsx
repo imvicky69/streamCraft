@@ -130,11 +130,16 @@ export default function App() {
   };
 
   const [downloadController, setDownloadController] = useState(null);
+  const [currentDownloadId, setCurrentDownloadId] = useState(null);
 
   const handleCancelDownload = () => {
     if (downloadController) {
       downloadController.abort();
       setDownloadController(null);
+    }
+    if (currentDownloadId) {
+      fetch(`/api/cancel-download?download_id=${currentDownloadId}`, { method: 'POST' }).catch(() => {});
+      setCurrentDownloadId(null);
     }
     setDownloading(false);
     setDownloadProgress({ percent: 0, receivedMB: '0', totalMB: '', speed: '', eta: '', status: '' });
@@ -142,6 +147,9 @@ export default function App() {
 
   const handleDownload = async () => {
     if (!videoInfo || !selectedStream) return;
+
+    const downloadId = 'dl_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
+    setCurrentDownloadId(downloadId);
 
     const controller = new AbortController();
     setDownloadController(controller);
@@ -159,7 +167,7 @@ export default function App() {
 
     try {
       const isAudio = !selectedStream.resolution;
-      const downloadSseUrl = `/api/download-single-sse?url=${encodeURIComponent(url.trim())}&itag=${selectedStream.itag}&audio_only=${isAudio}`;
+      const downloadSseUrl = `/api/download-single-sse?url=${encodeURIComponent(url.trim())}&itag=${selectedStream.itag}&audio_only=${isAudio}&download_id=${downloadId}`;
 
       const response = await fetch(downloadSseUrl, { signal: controller.signal });
       if (!response.ok) {
