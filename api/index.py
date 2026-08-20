@@ -193,10 +193,10 @@ def get_base_ydl_opts(extra_opts: Optional[dict] = None) -> dict:
         "no_warnings": True,
         "nocheckcertificate": True,
         "ignoreerrors": False,
-        "socket_timeout": 30,
+        "socket_timeout": 15,
         "http_chunk_size": 10485760,  # 10MB chunks for fast parallel streaming
-        "retries": 10,
-        "fragment_retries": 10,
+        "retries": 3,
+        "fragment_retries": 3,
     }
 
     if PO_TOKEN:
@@ -739,9 +739,19 @@ async def download_direct(
         ydl_opts["merge_output_format"] = "mp4"
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(raw_url, download=True)
-            title = info_dict.get("title", "media") if info_dict else "media"
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info_dict = ydl.extract_info(raw_url, download=True)
+                title = info_dict.get("title", "media") if info_dict else "media"
+        except Exception as pe:
+            if ydl_opts.get("proxy"):
+                print(f"[Proxy Failed] Retrying directly without proxy: {pe}")
+                ydl_opts.pop("proxy", None)
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info_dict = ydl.extract_info(raw_url, download=True)
+                    title = info_dict.get("title", "media") if info_dict else "media"
+            else:
+                raise pe
 
         downloaded_files = [
             os.path.join(temp_dir, f) for f in os.listdir(temp_dir)

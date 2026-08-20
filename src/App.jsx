@@ -159,175 +159,37 @@ export default function App() {
     setDownloadProgress({ percent: 0, receivedMB: '0', totalMB: '', speed: '', eta: '', status: '' });
   };
 
-  const handleDownload = async () => {
+  const handleDownload = () => {
     if (!videoInfo || !selectedStream) return;
 
     const isAudio = !selectedStream.resolution;
+    const cleanTitle = (videoInfo.title || 'media').replace(/[\\/*?:"<>|]/g, '');
 
-    // 🚀 ULTRA-FAST DIRECT STREAM PATH:
-    if (!isAudio && selectedStream.direct_url) {
-      setDownloading(true);
-      setDownloadSuccess(false);
-      setDownloadProgress({
-        percent: 100,
-        receivedMB: selectedStream.filesize_formatted || '',
-        totalMB: selectedStream.filesize_formatted || '',
-        speed: 'Max Speed',
-        eta: 'Instant',
-        status: '🚀 Streaming directly from YouTube CDN at maximum network speed...',
-      });
-
-      const cleanTitle = (videoInfo.title || 'video').replace(/[\\/*?:"<>|]/g, '');
-      const pipeUrl = `${BACKEND_BASE}/api/proxy-pipe?stream_url=${encodeURIComponent(selectedStream.direct_url)}&title=${encodeURIComponent(cleanTitle)}&ext=${selectedStream.extension || 'mp4'}`;
-
-      const a = document.createElement('a');
-      a.href = pipeUrl;
-      a.download = `${cleanTitle}.${selectedStream.extension || 'mp4'}`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-
-      setTimeout(() => {
-        setDownloadSuccess(true);
-        setDownloading(false);
-      }, 1200);
-      return;
-    }
-
-    const downloadId = 'dl_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
-    setCurrentDownloadId(downloadId);
-
-    const controller = new AbortController();
-    setDownloadController(controller);
     setDownloading(true);
     setDownloadSuccess(false);
     setDownloadProgress({
-      percent: 5,
-      receivedMB: '0',
-      totalMB: selectedStream.filesize ? (selectedStream.filesize / (1024 * 1024)).toFixed(1) : '',
-      speed: 'Connecting...',
-      eta: 'Calculating...',
-      status: '⚡ Connecting to YouTube stream...',
+      percent: 100,
+      receivedMB: selectedStream.filesize_formatted || '',
+      totalMB: selectedStream.filesize_formatted || '',
+      speed: 'High Speed',
+      eta: 'Instant',
+      status: `🚀 Starting ${isAudio ? 'MP3 Audio' : selectedStream.resolution + ' MP4 Video'} download in your browser...`,
     });
     setError('');
 
-    try {
-      const downloadSseUrl = `${BACKEND_BASE}/api/download-single-sse?url=${encodeURIComponent(url.trim())}&itag=${selectedStream.itag}&audio_only=${isAudio}&download_id=${downloadId}`;
+    // Trigger direct browser download directly from Render backend
+    const directUrl = `${BACKEND_BASE}/api/download-direct?url=${encodeURIComponent(url.trim())}&itag=${selectedStream.itag}&audio_only=${isAudio}`;
+    const a = document.createElement('a');
+    a.href = directUrl;
+    a.download = `${cleanTitle}.${isAudio ? 'mp3' : 'mp4'}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
 
-      const response = await fetch(downloadSseUrl, { signal: controller.signal });
-      if (!response.ok) {
-        if (response.status === 502 || response.status === 504) {
-          console.warn('Vercel 502 proxy detected on SSE. Switching to direct download mode...');
-          setDownloadProgress(prev => ({
-            ...prev,
-            percent: 90,
-            status: '⚡ Downloading directly from server...',
-          }));
-
-          const directUrl = `${BACKEND_BASE}/api/download-direct?url=${encodeURIComponent(url.trim())}&itag=${selectedStream.itag}&audio_only=${isAudio}`;
-          const cleanTitle = (videoInfo.title || 'media').replace(/[\\/*?:"<>|]/g, '');
-          const a = document.createElement('a');
-          a.href = directUrl;
-          a.download = `${cleanTitle}.${isAudio ? 'mp3' : 'mp4'}`;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-
-          setDownloadSuccess(true);
-          setDownloading(false);
-          return;
-        }
-
-        let errText = 'Download failed to initialize.';
-        try {
-          const errJson = await response.json();
-          errText = errJson.detail || errText;
-        } catch {
-          errText = `Download failed with status ${response.status}`;
-        }
-        throw new Error(errText);
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith('data:')) continue;
-          const jsonStr = trimmed.replace(/^data:\s*/, '');
-          try {
-            const data = JSON.parse(jsonStr);
-
-            if (data.type === 'progress') {
-              setDownloadProgress(prev => ({
-                ...prev,
-                percent: data.percent || prev.percent,
-                receivedMB: data.receivedMB || prev.receivedMB,
-                totalMB: data.totalMB || prev.totalMB,
-                speed: data.speed || prev.speed,
-                eta: data.eta || prev.eta,
-                status: data.status || prev.status,
-              }));
-            } else if (data.type === 'converting') {
-              setDownloadProgress(prev => ({
-                ...prev,
-                percent: data.percent || 92,
-                speed: data.speed || 'Processing',
-                eta: data.eta || 'Few seconds',
-                status: data.status || '✨ Converting / Packaging stream...',
-              }));
-            } else if (data.type === 'complete') {
-              setDownloadProgress({
-                percent: 100,
-                receivedMB: data.size_formatted || '',
-                totalMB: data.size_formatted || '',
-                speed: 'Finished',
-                eta: '0s',
-                status: '🎉 Download complete! Starting browser download...',
-              });
-
-              // Trigger native browser download directly from Render backend
-              const fileUrl = `${BACKEND_BASE}/api/get-single-file?file_id=${data.file_id}`;
-              const a = document.createElement('a');
-              a.href = fileUrl;
-              a.download = data.filename || 'media';
-              document.body.appendChild(a);
-              a.click();
-              document.body.removeChild(a);
-
-              setDownloadSuccess(true);
-              setDownloading(false);
-              return;
-            } else if (data.type === 'error') {
-              throw new Error(data.message || 'Download failed on server.');
-            }
-          } catch (pe) {
-            if (pe.message && !pe.message.includes('JSON')) {
-              throw pe;
-            }
-          }
-        }
-      }
-    } catch (err) {
-      if (err.name === 'AbortError') {
-        console.log('Download cancelled by user.');
-      } else {
-        console.error('Download error:', err);
-        setError(err.message || 'Could not complete download.');
-      }
+    setTimeout(() => {
+      setDownloadSuccess(true);
       setDownloading(false);
-    } finally {
-      setDownloadController(null);
-    }
+    }, 2500);
   };
 
   // Real-time SSE playlist ZIP download with live ETA & progress
