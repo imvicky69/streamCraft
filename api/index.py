@@ -113,6 +113,39 @@ def sanitize_filename(name: str) -> str:
     return ascii_clean or "media"
 
 
+def get_base_ydl_opts() -> dict:
+    """Base yt-dlp options with iOS, Android, and mweb player clients to bypass cloud datacenter bot checks."""
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'socket_timeout': 15,
+        'retries': 3,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'android', 'mweb', 'web_creator', 'tv_embedded'],
+                'player_skip': ['webpage', 'configs'],
+            }
+        },
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
+    }
+
+    # Support optional cookies from environment variable for Vercel/cloud
+    cookies_env = os.environ.get('YOUTUBE_COOKIES') or os.environ.get('YT_COOKIES')
+    if cookies_env:
+        try:
+            cookie_file = tempfile.NamedTemporaryFile(delete=False, suffix='.txt', mode='w', encoding='utf-8')
+            cookie_file.write(cookies_env)
+            cookie_file.close()
+            opts['cookiefile'] = cookie_file.name
+        except Exception:
+            pass
+
+    return opts
+
+
 @app.get("/api/health")
 def health():
     return {
@@ -132,14 +165,11 @@ def get_video_info(req: VideoInfoRequest):
 
     if HAS_YTDLP:
         try:
-            ydl_opts = {
-                'quiet': True,
-                'no_warnings': True,
+            ydl_opts = get_base_ydl_opts()
+            ydl_opts.update({
                 'skip_download': True,
                 'extract_flat': 'in_playlist',
-                'socket_timeout': 10,
-                'retries': 2,
-            }
+            })
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 
@@ -281,14 +311,13 @@ def download_stream(
             out_template = os.path.join(tmp_dir, "%(title)s.%(ext)s")
 
             has_ffmpeg = bool(shutil.which('ffmpeg'))
+            ydl_opts = get_base_ydl_opts()
+            ydl_opts.update({
+                'outtmpl': out_template,
+            })
 
             if audio_only:
-                ydl_opts = {
-                    'format': 'bestaudio/best',
-                    'outtmpl': out_template,
-                    'quiet': True,
-                    'no_warnings': True,
-                }
+                ydl_opts['format'] = 'bestaudio/best'
                 if has_ffmpeg:
                     ydl_opts['postprocessors'] = [{
                         'key': 'FFmpegExtractAudio',
@@ -300,12 +329,7 @@ def download_stream(
                     fmt = f"{itag}+bestaudio/best" if itag.isdigit() else "bestvideo+bestaudio/best/best"
                 else:
                     fmt = f"{itag}/bestvideo+bestaudio/best"
-                ydl_opts = {
-                    'format': fmt,
-                    'outtmpl': out_template,
-                    'quiet': True,
-                    'no_warnings': True,
-                }
+                ydl_opts['format'] = fmt
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -357,21 +381,24 @@ def download_stream(
 
         except HTTPException:
             raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Download error: {str(e)}")
+        except Exception as err:
+            raise HTTPException(status_code=500, detail=f"Download error: {str(err)}")
 
     raise HTTPException(status_code=500, detail="Download engine not available.")
 
 
 @app.get("/api/playlist-zip-sse")
 def playlist_zip_sse(
-    url: str = Query(..., description="Playlist URL"),
-    audio_only: bool = Query(True, description="Whether to convert tracks to MP3"),
-    max_tracks: int = Query(10, description="Max number of tracks to download")
+    url: str = Query(..., description="YouTube playlist URL"),
+    audio_only: bool = Query(True, description="Download as MP3 (True) or MP4 video (False)"),
+    max_tracks: int = Query(10, description="Max number of tracks to download"),
 ):
-    """Server-Sent Events stream yielding real-time progress per track, creating MP3 ZIP archive."""
+    """
+    Stream playlist progress via Server-Sent Events (SSE), download tracks,
+    package into a single ZIP file, and return the download file_id when ready.
+    """
     clean_target_url = clean_url(url)
-    tracks_limit = min(max(1, max_tracks), 30)
+    tracks_limit = min(max(1, max_tracks), 50)  # Safe cap between 1 and 50 tracks
 
     def event_stream():
         tmp_dir = tempfile.mkdtemp(prefix="pl_sse_")
@@ -382,12 +409,11 @@ def playlist_zip_sse(
             yield f"data: {json.dumps({'type': 'init', 'status': 'Analyzing playlist tracks...'})}\n\n"
 
             # 1. Fetch playlist metadata
-            ydl_opts_info = {
-                'quiet': True,
-                'no_warnings': True,
+            ydl_opts_info = get_base_ydl_opts()
+            ydl_opts_info.update({
                 'skip_download': True,
                 'extract_flat': 'in_playlist',
-            }
+            })
             with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
                 info = ydl.extract_info(clean_target_url, download=False)
                 playlist_title = sanitize_filename(info.get('title') or 'Playlist')
@@ -425,14 +451,13 @@ def playlist_zip_sse(
 
                 has_ffmpeg = bool(shutil.which('ffmpeg'))
                 out_tmpl = os.path.join(tracks_dir, f"{i:02d} - %(title)s.%(ext)s")
+                ydl_opts_dl = get_base_ydl_opts()
+                ydl_opts_dl.update({
+                    'outtmpl': out_tmpl,
+                    'ignoreerrors': True,
+                })
                 if audio_only:
-                    ydl_opts_dl = {
-                        'format': 'bestaudio/best',
-                        'outtmpl': out_tmpl,
-                        'quiet': True,
-                        'no_warnings': True,
-                        'ignoreerrors': True,
-                    }
+                    ydl_opts_dl['format'] = 'bestaudio/best'
                     if has_ffmpeg:
                         ydl_opts_dl['postprocessors'] = [{
                             'key': 'FFmpegExtractAudio',
@@ -440,13 +465,7 @@ def playlist_zip_sse(
                             'preferredquality': '192',
                         }]
                 else:
-                    ydl_opts_dl = {
-                        'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best' if has_ffmpeg else 'best[height<=720]/best',
-                        'outtmpl': out_tmpl,
-                        'quiet': True,
-                        'no_warnings': True,
-                        'ignoreerrors': True,
-                    }
+                    ydl_opts_dl['format'] = 'bestvideo[height<=720]+bestaudio/best[height<=720]/best' if has_ffmpeg else 'best[height<=720]/best'
 
                 try:
                     with yt_dlp.YoutubeDL(ydl_opts_dl) as ydl_track:
