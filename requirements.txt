@@ -1,5 +1,8 @@
 fastapi>=0.110.0
-yt-dlp>=2025.0.0
+yt-dlp[default] @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz
 pydantic>=2.6.0
-uvicorn>=0.28.0
+uvicorn[standard]>=0.28.0
+python-multipart>=0.0.9
 httpx>=0.27.0
+hatchling>=1.20.0
+wheel>=0.40.0

@@ -4,100 +4,35 @@ import re
 import json
 import time
 import uuid
-import random
-import base64
+import shutil
 import tempfile
 import zipfile
-import shutil
-import urllib.parse
-import subprocess
-import queue
 import threading
-from typing import Optional, List, Dict
+import queue
+import urllib.parse
+from typing import Optional, List, Dict, Any
+
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from pydantic import BaseModel
 
-# ── Auto-update yt-dlp at startup (always use latest bypass patches) ──────────
-def _auto_update_ytdlp():
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", "yt-dlp"],
-            capture_output=True, text=True, timeout=60
-        )
-        if result.returncode == 0:
-            print("[startup] yt-dlp upgraded successfully")
-        else:
-            print(f"[startup] yt-dlp upgrade warning: {result.stderr[:200]}")
-    except Exception as e:
-        print(f"[startup] yt-dlp upgrade skipped: {e}")
-
-_auto_update_ytdlp()
-
-# Enable static-ffmpeg if installed
+# Enable static-ffmpeg if available (useful in some containerized environments)
 try:
     import static_ffmpeg
     static_ffmpeg.add_paths()
 except Exception:
     pass
 
-# Try yt-dlp
-try:
-    import yt_dlp
-    HAS_YTDLP = True
-except ImportError:
-    HAS_YTDLP = False
+import yt_dlp
 
-# httpx for Invidious / Innertube fallback
-try:
-    import httpx
-    HAS_HTTPX = True
-except ImportError:
-    HAS_HTTPX = False
-
-# ── Proxy configuration ────────────────────────────────────────────────────────
-# Set PROXY_URL in Render → Environment Variables.
-# Format: http://user:pass@host:port  OR  socks5://user:pass@host:port
-# Free residential proxies: webshare.io (10 free), proxyscrape.com
-PROXY_URL: Optional[str] = (
-    os.environ.get("PROXY_URL") or
-    os.environ.get("HTTPS_PROXY") or
-    os.environ.get("HTTP_PROXY") or
-    None
-)
-
-# ── PO Token (Proof of Origin — bypasses bot-detection on datacenter IPs) ─────
-# Set PO_TOKEN in Render → Environment Variables.
-# Generate: https://github.com/YunzheZJU/youtube-po-token-generator
-# Or manually from yt-dlp wiki: open youtube.com in browser and extract token.
-PO_TOKEN: Optional[str] = os.environ.get("PO_TOKEN") or None
-
-# ── Invidious public instances (cookie-free YouTube API) ──────────────────────
-# Shuffled randomly on each request to avoid hammering one instance.
-INVIDIOUS_INSTANCES = [
-    "https://yewtu.be",
-    "https://inv.tux.pizza",
-    "https://invidious.privacyredirect.com",
-    "https://invidious.io",
-    "https://inv.us.projectsegfault.net",
-    "https://invidious.slipfox.xyz",
-    "https://invidious.fdn.fr",
-    "https://invidious.nerdvpn.de",
-    "https://invidious.incogniweb.net",
-    "https://iv.ggtyler.dev",
-    "https://invidious.perennialte.ch",
-    "https://inv.bp.projectsegfault.net",
-]
-
+# ── App Initialization ────────────────────────────────────────────────────────
 app = FastAPI(
-    title="YouTube & YouTube Music Downloader API",
-    description="FastAPI backend for video info, MP3 conversion, and live SSE playlist ZIP downloads",
-    version="1.0.0"
+    title="StreamCraft API",
+    description="High-performance backend powered directly by yt-dlp for video info, MP3 conversion, and live SSE downloads",
+    version="2.0.0"
 )
 
-# Allow all origins in development; on production Render serves both frontend proxied via Vercel
-# and direct browser requests, so we keep '*' for maximum compatibility.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -106,1391 +41,774 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory store for generated zip files and single download files
-ZIP_STORAGE: Dict[str, Dict] = {}
-SINGLE_FILE_STORAGE: Dict[str, Dict] = {}
-
-# In-memory LRU metadata cache (URL -> (timestamp, response_data)) to make info analysis instant (0.01s)
-INFO_CACHE: Dict[str, tuple] = {}
-
-# Active downloads tracking for instantaneous cancellation
+# ── In-Memory Storages & Active Tasks ──────────────────────────────────────────
+SINGLE_FILE_STORAGE: Dict[str, Dict[str, Any]] = {}
+ZIP_STORAGE: Dict[str, Dict[str, Any]] = {}
 ACTIVE_DOWNLOADS: Dict[str, threading.Event] = {}
 
+# ── Configuration & Environment Helpers ───────────────────────────────────────
+PROXY_URL: Optional[str] = (
+    os.environ.get("PROXY_URL") or
+    os.environ.get("HTTPS_PROXY") or
+    os.environ.get("HTTP_PROXY") or
+    None
+)
 
-class VideoInfoRequest(BaseModel):
-    url: str
+PO_TOKEN: Optional[str] = os.environ.get("PO_TOKEN") or None
 
 
+def get_cookie_file_path() -> Optional[str]:
+    """Find local cookie file or write environment variable YOUTUBE_COOKIES to a temp file."""
+    raw_cookies = (
+        os.environ.get("YOUTUBE_COOKIES") or
+        os.environ.get("YT_COOKIES") or
+        os.environ.get("COOKIES")
+    )
+    if raw_cookies and raw_cookies.strip():
+        try:
+            tf = tempfile.NamedTemporaryFile(delete=False, suffix="_ytdlp_env_cookie.txt", mode="w", encoding="utf-8")
+            tf.write(raw_cookies.strip() + "\n")
+            tf.close()
+            return tf.name
+        except Exception as e:
+            print(f"[Cookies] Failed to write temp cookie from env: {e}")
+
+    candidate_paths = [
+        "cookie.txt",
+        "cookies.txt",
+        "cookie_clean.txt",
+        "test_cookie.txt",
+        os.path.join(os.path.dirname(__file__), "..", "cookie.txt"),
+        os.path.join(os.path.dirname(__file__), "..", "cookie_clean.txt"),
+        os.path.join(os.path.dirname(__file__), "cookie.txt"),
+    ]
+    for cp in candidate_paths:
+        if os.path.exists(cp) and os.path.getsize(cp) > 10:
+            return os.path.abspath(cp)
+
+    return None
+
+
+def get_base_ydl_opts(extra_opts: Optional[dict] = None) -> dict:
+    """Build standard yt-dlp options dictionary with cookies, proxy, and robust extractor options."""
+    cookie_file = get_cookie_file_path()
+    opts: dict = {
+        "quiet": True,
+        "no_warnings": True,
+        "nocheckcertificate": True,
+        "ignoreerrors": False,
+        "socket_timeout": 30,
+        "http_chunk_size": 10485760,  # 10MB chunks for fast parallel streaming
+        "retries": 10,
+        "fragment_retries": 10,
+    }
+
+    if PO_TOKEN:
+        opts["extractor_args"] = {"youtube": {"po_token": [f"web+{PO_TOKEN}"]}}
+
+    if cookie_file and os.path.exists(cookie_file):
+        opts["cookiefile"] = cookie_file
+
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
+
+    if extra_opts:
+        opts.update(extra_opts)
+
+    return opts
+
+
+# ── String & Format Formatting Helpers ─────────────────────────────────────────
 def format_size(bytes_size: Optional[int], is_approx: bool = False) -> str:
-    """Format bytes into readable string."""
+    """Format bytes into human-readable string (MB, GB, etc.)."""
     if not bytes_size or bytes_size <= 0:
         return "Unknown size"
     size = float(bytes_size)
     prefix = "~" if is_approx else ""
-    for unit in ['B', 'KB', 'MB', 'GB']:
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
         if size < 1024.0:
             return f"{prefix}{size:.1f} {unit}"
         size /= 1024.0
-    return f"{prefix}{size:.1f} TB"
+    return f"{prefix}{size:.1f} PB"
 
 
-def format_duration(seconds: Optional[int]) -> str:
-    """Format seconds into HH:MM:SS or MM:SS."""
+def format_duration(seconds: Optional[float]) -> str:
+    """Format duration into HH:MM:SS or MM:SS."""
     if not seconds:
         return "0:00"
-    mins, secs = divmod(int(seconds), 60)
+    total_secs = int(seconds)
+    mins, secs = divmod(total_secs, 60)
     hours, mins = divmod(mins, 60)
     if hours > 0:
         return f"{hours:02d}:{mins:02d}:{secs:02d}"
     return f"{mins:02d}:{secs:02d}"
 
 
-def clean_url(url: str) -> str:
-    """Normalize URL, transform music.youtube.com & shorts, fix missing https:// or support search keywords."""
-    url = url.strip()
-
-    # If user typed search keywords (e.g. "Tum ho" or "Song Name") without a URL structure
-    if not (url.startswith('http://') or url.startswith('https://') or 'youtube.com' in url or 'youtu.be' in url):
-        if '.' not in url or '/' not in url:
-            return f"ytsearch1:{url}"
-
-    url = re.sub(r'\s+', '', url)
-
-    if not url.startswith('http://') and not url.startswith('https://'):
-        url = 'https://' + url
-
-    # Transform music.youtube.com to standard youtube.com
-    url = url.replace('music.youtube.com', 'www.youtube.com')
-
-    # Transform shorts to watch
-    if '/shorts/' in url:
-        url = url.replace('/shorts/', '/watch?v=')
-
-    # Transform youtu.be to watch
-    if 'youtu.be/' in url:
-        parts = url.split('youtu.be/')[1].split('?')[0]
-        url = f'https://www.youtube.com/watch?v={parts}'
-
-    # If it's a single watch video URL, strip radio mix / index parameters
-    if 'watch?v=' in url and '&list=' in url:
-        url = url.split('&list=')[0]
-    if 'watch?v=' in url and '&index=' in url:
-        url = url.split('&index=')[0]
-
-    # Clean trailing ampersands
-    url = url.rstrip('&?')
-    return url
+def format_views(view_count: Optional[int]) -> str:
+    """Format view counts into readable K/M/B."""
+    if not view_count or view_count < 0:
+        return "0 views"
+    if view_count >= 1_000_000_000:
+        return f"{view_count / 1_000_000_000:.1f}B views"
+    if view_count >= 1_000_000:
+        return f"{view_count / 1_000_000:.1f}M views"
+    if view_count >= 1_000:
+        return f"{view_count / 1_000:.1f}K views"
+    return f"{view_count:,} views"
 
 
 def sanitize_filename(name: str) -> str:
-    """Make filename safe for filesystem and ASCII HTTP headers (strip emojis/non-ascii)."""
-    clean = re.sub(r'[\\/*?:"<>|]', '', name)
-    ascii_clean = clean.encode('ascii', 'ignore').decode('ascii').strip()
-    return ascii_clean or "media"
+    """Sanitize string to be filesystem safe and ASCII compatible."""
+    clean = re.sub(r'[\\/*?:"<>|]', "", name)
+    clean = clean.encode("ascii", "ignore").decode("ascii").strip()
+    return clean or "media"
 
 
-COOKIE_FILES: List[str] = []
+def clean_url(url: str) -> str:
+    """Normalize user input, handling search queries, shorts, music URLs, and playlist parameters."""
+    url = url.strip()
+    if not url:
+        return url
+
+    # Search keyword support
+    is_url = (
+        url.startswith("http://") or
+        url.startswith("https://") or
+        "youtube.com" in url or
+        "youtu.be" in url
+    )
+    if not is_url:
+        if "." not in url or "/" not in url:
+            return f"ytsearch1:{url}"
+
+    url = re.sub(r"\s+", "", url)
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+
+    # Map music.youtube.com to standard www.youtube.com
+    url = url.replace("music.youtube.com", "www.youtube.com")
+
+    # Transform shorts to watch
+    if "/shorts/" in url:
+        url = url.replace("/shorts/", "/watch?v=")
+
+    # Transform youtu.be/ID to watch?v=ID
+    if "youtu.be/" in url:
+        parts = url.split("youtu.be/")[1].split("?")[0]
+        url = f"https://www.youtube.com/watch?v={parts}"
+
+    # Strip radio mix params from single video URLs
+    if "watch?v=" in url and "&list=RD" in url:
+        url = url.split("&list=RD")[0]
+
+    return url.rstrip("&?")
 
 
-def clean_netscape_cookies(raw_text: str) -> str:
-    """Preserve ALL YouTube cookies — do NOT strip anti-bot cookies.
-    YouTube uses VISITOR_INFO1_LIVE, YSC, CONSISTENCY etc for bot checks.
-    Removing them is what causes the 'Sign in to confirm' error on cloud IPs.
-    """
-    lines = raw_text.splitlines()
-    clean_lines = ['# Netscape HTTP Cookie File']
-    for l in lines:
-        if not l.strip():
-            continue
-        # Keep comment header lines
-        if l.startswith('#'):
-            if 'Netscape' in l or 'yt-dlp' in l or 'Do not edit' in l:
-                continue  # skip duplicate headers
-            continue
-        parts = l.strip().split('\t')
-        if len(parts) >= 7:
-            clean_lines.append(l)
-    return '\n'.join(clean_lines) + '\n'
+# ── Schemas ───────────────────────────────────────────────────────────────────
+class VideoInfoRequest(BaseModel):
+    url: str
 
 
-def init_cookie_pool():
-    """Discover, sanitize, and initialize multiple cookie accounts from env variables and files."""
-    global COOKIE_FILES
-    COOKIE_FILES = []
-
-    # 1. Local cookie files
-    candidate_paths = [
-        'cookie.txt', 'cookies.txt', 'youtube_cookies.txt', '/tmp/cookies.txt',
-        'cookies_1.txt', 'cookies_2.txt',
-        os.path.join(os.path.dirname(__file__), '..', 'cookie.txt'),
-        os.path.join(os.path.dirname(__file__), '..', 'cookies.txt'),
-        os.path.join(os.path.dirname(__file__), 'cookie.txt'),
-    ]
-
-    for local_file in candidate_paths:
-        if os.path.exists(local_file):
+# ── Cleanup helper for old stored files ───────────────────────────────────────
+def cleanup_old_files():
+    """Remove stored temporary files older than 1 hour."""
+    now = time.time()
+    for sid, info in list(SINGLE_FILE_STORAGE.items()):
+        if now - info.get("created_at", now) > 3600:
             try:
-                with open(local_file, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read().strip()
-                if content:
-                    cleaned = clean_netscape_cookies(content)
-                    tf = tempfile.NamedTemporaryFile(delete=False, suffix='_cleaned_cookie.txt', mode='w', encoding='utf-8')
-                    tf.write(cleaned)
-                    tf.close()
-                    if tf.name not in COOKIE_FILES:
-                        COOKIE_FILES.append(tf.name)
-            except Exception as e:
-                print(f"Notice: Failed to load local cookie {local_file}: {e}")
+                if os.path.exists(info["filepath"]):
+                    os.remove(info["filepath"])
+            except Exception:
+                pass
+            SINGLE_FILE_STORAGE.pop(sid, None)
 
-    # 2. Environment variables: YOUTUBE_COOKIES, YOUTUBE_COOKIES_1, YOUTUBE_COOKIES_2, etc.
-    cookie_entries = []
-    for k, v in os.environ.items():
-        if (k.startswith('YOUTUBE_COOKIE') or k.startswith('YT_COOKIE') or k == 'COOKIES') and v.strip():
-            if '===COOKIE===' in v:
-                cookie_entries.extend([part.strip() for part in v.split('===COOKIE===') if part.strip()])
-            else:
-                cookie_entries.append(v.strip())
-
-    for idx, raw_cookie in enumerate(cookie_entries):
-        try:
-            import base64
-            if not raw_cookie.startswith('# Netscape') and '\t' not in raw_cookie:
-                try:
-                    decoded = base64.b64decode(raw_cookie).decode('utf-8')
-                    if '# Netscape' in decoded or '\t' in decoded:
-                        raw_cookie = decoded
-                except Exception:
-                    pass
-
-            cleaned = clean_netscape_cookies(raw_cookie)
-            f = tempfile.NamedTemporaryFile(delete=False, suffix=f'_yt_cookie_{idx}.txt', mode='w', encoding='utf-8')
-            f.write(cleaned)
-            f.close()
-            COOKIE_FILES.append(f.name)
-        except Exception as e:
-            print(f"Notice: Failed to load cookie #{idx}: {e}")
+    for zid, info in list(ZIP_STORAGE.items()):
+        if now - info.get("created_at", now) > 3600:
+            try:
+                if os.path.exists(info["filepath"]):
+                    os.remove(info["filepath"])
+            except Exception:
+                pass
+            ZIP_STORAGE.pop(zid, None)
 
 
-# Initialize pool at startup
-init_cookie_pool()
-
-
-def get_base_ydl_opts(cookie_idx: Optional[int] = None, use_cookies: bool = True) -> dict:
-    """
-    Build yt-dlp options with:
-    - Cookie pool rotation (if enabled)
-    - JS challenge solving via node / remote components
-    - Proxy support (PROXY_URL env var)
-    - PO token support (PO_TOKEN env var)
-    """
-    global COOKIE_FILES
-    if not COOKIE_FILES:
-        init_cookie_pool()
-
-    cookie_file_path = None
-    if use_cookies and COOKIE_FILES:
-        if cookie_idx is not None and 0 <= cookie_idx < len(COOKIE_FILES):
-            cookie_file_path = COOKIE_FILES[cookie_idx]
-        else:
-            cookie_file_path = random.choice(COOKIE_FILES)
-
-    extractor_args = {'youtube': {}}
-
-    # Player client order: web + ios + mweb + android gives full 1080p/720p DASH video formats
-    if PO_TOKEN:
-        extractor_args['youtube']['po_token'] = [f'web+{PO_TOKEN}']
-        extractor_args['youtube']['player_client'] = ['web', 'ios', 'mweb', 'android']
-    elif PROXY_URL:
-        extractor_args['youtube']['player_client'] = ['web', 'ios', 'mweb', 'android']
-
-    has_node = bool(shutil.which('node'))
-
-    opts: dict = {
-        'quiet': True,
-        'no_warnings': True,
-        'socket_timeout': 15,
-        'retries': 3,
-        'fragment_retries': 3,
-        'concurrent_fragment_downloads': 8,   # 8x parallel downloading for maximum speed
-        'buffersize': 2 * 1024 * 1024,
-        'http_chunk_size': 20971520,          # 20MB chunked downloads
-        'nocheckcertificate': True,
-        'merge_output_format': 'mp4',
-        'http_headers': {
-            'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/128.0.0.0 Safari/537.36'
-            ),
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        },
-        'geo_bypass': True,
-        'geo_bypass_country': 'US',
-    }
-
-    if extractor_args.get('youtube'):
-        opts['extractor_args'] = extractor_args
-
-    if has_node:
-        opts['js_runtimes'] = {'node': {}}
-        opts['remote_components'] = ['ejs:github']
-
-    if cookie_file_path:
-        opts['cookiefile'] = cookie_file_path
-
-    if PROXY_URL:
-        opts['proxy'] = PROXY_URL
-
-    return opts
-
-
-def _ytdlp_extract_info(url: str) -> Optional[dict]:
-    """
-    Try yt-dlp with multiple strategies:
-    1. Standard with cookies (if loaded)
-    2. Clean direct connection without cookies (fixes expired cookie blocks)
-    3. Multi-client fallback (android, ios, web, mweb)
-    4. Direct connection without proxy (if proxy is configured)
-    Returns None if all fail so fallbacks (Innertube/Invidious) can run.
-    """
-    if not HAS_YTDLP:
-        return None
-
-    base_extract_opts = {'skip_download': True, 'extract_flat': 'in_playlist'}
-    strategies = []
-
-    # Strategy 1: Standard with configured options (with cookies if any)
-    s1 = get_base_ydl_opts(use_cookies=True)
-    s1.update(base_extract_opts)
-    strategies.append(("primary", s1))
-
-    # Strategy 2: Clean without cookies (fixes "The page needs to be reloaded" or expired cookies)
-    s2 = get_base_ydl_opts(use_cookies=False)
-    s2.update(base_extract_opts)
-    strategies.append(("clean-no-cookies", s2))
-
-    # Strategy 3: Multi-client without cookies
-    s3 = get_base_ydl_opts(use_cookies=False)
-    s3['extractor_args'] = {
-        'youtube': {'player_client': ['android', 'ios', 'web', 'mweb']}
-    }
-    s3.update(base_extract_opts)
-    strategies.append(("multi-client-no-cookies", s3))
-
-    # Strategy 4: Direct connection without proxy (in case proxy is down or throws 502 Bad Gateway)
-    if PROXY_URL:
-        s4 = get_base_ydl_opts(use_cookies=False)
-        s4.pop('proxy', None)
-        s4.update(base_extract_opts)
-        strategies.append(("direct-no-proxy-fallback", s4))
-
-    for strategy_name, opts in strategies:
-        try:
-            print(f"[yt-dlp] Trying strategy: {strategy_name}")
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-            if info:
-                print(f"[yt-dlp] Success with strategy: {strategy_name}")
-                return info
-        except Exception as e:
-            err_msg = str(e)
-            print(f"[yt-dlp] Strategy '{strategy_name}' failed: {err_msg[:120]}")
-            if "Video unavailable" in err_msg or "Private video" in err_msg or "removed by the uploader" in err_msg:
-                raise HTTPException(status_code=400, detail="This video is unavailable or private.")
-            # Format/client/bot error -> try next strategy or fallback
-            continue
-
-    return None  # All strategies exhausted — proceed to Innertube/Invidious fallbacks
-
-
+# ── Endpoint: Health Check ───────────────────────────────────────────────────
 @app.get("/api/health")
-def health():
+async def health_check():
+    cookie_file = get_cookie_file_path()
     return {
         "status": "ok",
-        "engine": "yt-dlp" if HAS_YTDLP else "none",
-        "fallback_engine": "innertube+invidious" if HAS_HTTPX else "none",
-        "cookies_loaded": len(COOKIE_FILES),
-        "proxy_configured": bool(PROXY_URL),
-        "po_token_configured": bool(PO_TOKEN),
-        "message": "Downloader API is operational"
-    }
-
-
-@app.get("/api/debug")
-def debug():
-    """Test all Invidious instances and report connectivity from this server."""
-    results = {}
-    TEST_VIDEO = "dQw4w9WgXcQ"  # Rick Astley — always public
-    if HAS_HTTPX:
-        proxy_kwargs = {"proxy": PROXY_URL} if PROXY_URL else {}
-        for instance in INVIDIOUS_INSTANCES:
-            try:
-                url = f"{instance}/api/v1/videos/{TEST_VIDEO}?fields=title"
-                resp = httpx.get(url, timeout=8, follow_redirects=True, **proxy_kwargs)
-                results[instance] = {
-                    "status": resp.status_code,
-                    "ok": resp.status_code == 200,
-                    "title": resp.json().get("title", "N/A") if resp.status_code == 200 else None
-                }
-            except Exception as e:
-                results[instance] = {"status": "error", "ok": False, "error": str(e)[:80]}
-    else:
-        results["error"] = "httpx not installed"
-
-    ytdlp_version = "not installed"
-    if HAS_YTDLP:
-        try:
-            ytdlp_version = yt_dlp.version.__version__
-        except Exception:
-            ytdlp_version = "unknown"
-
-    return {
-        "invidious_instances": results,
-        "working_instances": [k for k, v in results.items() if isinstance(v, dict) and v.get("ok")],
-        "yt_dlp_version": ytdlp_version,
-        "cookies_loaded": len(COOKIE_FILES),
+        "service": "StreamCraft Backend",
+        "yt_dlp_version": getattr(yt_dlp.version, "__version__", "unknown"),
+        "cookies_configured": bool(cookie_file),
         "proxy_configured": bool(PROXY_URL),
         "po_token_configured": bool(PO_TOKEN),
     }
 
 
-# ── Cookie-free fallback engines ──────────────────────────────────────────────
+# ── Endpoint: Video / Playlist Info ──────────────────────────────────────────
+@app.post("/api/info")
+async def get_info(request: VideoInfoRequest):
+    cleanup_old_files()
+    raw_url = clean_url(request.url)
+    if not raw_url:
+        raise HTTPException(status_code=400, detail="Please provide a valid YouTube URL or search query.")
 
-def extract_video_id(url: str) -> Optional[str]:
-    """Extract YouTube video ID from any URL format."""
-    m = re.search(r'(?:v=|youtu\.be/|/embed/|/v/|/watch\?v=)([A-Za-z0-9_-]{11})', url)
-    return m.group(1) if m else None
+    opts = get_base_ydl_opts({
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+    })
 
-
-YT_INNERTUBE_CLIENTS = [
-    # Smart TV embedded — YouTube uses for smart TVs on ISP networks, barely flagged on cloud IPs
-    {
-        "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-        "clientVersion": "2.0",
-        "key": "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
-        "user_agent": "Mozilla/5.0 (SMART-TV; LINUX; Tizen 5.5) AppleWebKit/537.36",
-    },
-    # Android VR — headset client, very low datacenter detection
-    {
-        "clientName": "ANDROID_VR",
-        "clientVersion": "1.56.21",
-        "androidSdkVersion": 32,
-        "key": "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
-        "user_agent": "com.google.android.apps.youtube.vr.oculus/1.56.21 (Linux; U; Android 12) gzip",
-    },
-    # iOS Messages Extension — secondary embedded client
-    {
-        "clientName": "IOS_MESSAGES_EXTENSION",
-        "clientVersion": "19.29.1",
-        "deviceModel": "iPhone16,2",
-        "osVersion": "17.5.1.21F90",
-        "key": "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc",
-        "user_agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)",
-    },
-    # Android Music — rarely flagged, separate app client
-    {
-        "clientName": "ANDROID_MUSIC",
-        "clientVersion": "7.27.52",
-        "androidSdkVersion": 30,
-        "key": "AIzaSyAOghZGza2MQSZkY_zfZ370N-PUdXEo8AI",
-        "user_agent": "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 11) gzip",
-    },
-    # Web embedded player — last resort Innertube attempt
-    {
-        "clientName": "WEB_EMBEDDED_PLAYER",
-        "clientVersion": "2.20240101.00.00",
-        "key": "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    },
-]
-
-
-def innertube_get_info(video_id: str) -> Optional[dict]:
-    """Call YouTube's internal Innertube API — no cookies, minimal bot detection."""
-    if not HAS_HTTPX:
-        return None
-
-    proxy_kwargs = {"proxy": PROXY_URL} if PROXY_URL else {}
-
-    for client_cfg in YT_INNERTUBE_CLIENTS:
-        try:
-            key = client_cfg["key"]
-            api_url = f"https://www.youtube.com/youtubei/v1/player?key={key}&prettyPrint=false"
-
-            ctx: dict = {
-                "clientName": client_cfg["clientName"],
-                "clientVersion": client_cfg["clientVersion"],
-                "hl": "en",
-                "gl": "US",
-                "utcOffsetMinutes": 0,
-            }
-            if "androidSdkVersion" in client_cfg:
-                ctx["androidSdkVersion"] = client_cfg["androidSdkVersion"]
-            if "deviceModel" in client_cfg:
-                ctx["deviceModel"] = client_cfg["deviceModel"]
-            if "osVersion" in client_cfg:
-                ctx["osVersion"] = client_cfg["osVersion"]
-
-            payload = {
-                "videoId": video_id,
-                "context": {"client": ctx},
-                "racyCheckOk": True,
-                "contentCheckOk": True,
-                # PO token hint (helps on blocked IPs when configured)
-                "serviceIntegrityDimensions": {"poToken": PO_TOKEN} if PO_TOKEN else {},
-            }
-
-            resp = httpx.post(
-                api_url, json=payload, timeout=8,
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": client_cfg["user_agent"],
-                    "Origin": "https://www.youtube.com",
-                    "Referer": f"https://www.youtube.com/watch?v={video_id}",
-                    "X-YouTube-Client-Name": client_cfg["clientName"],
-                    "X-YouTube-Client-Version": client_cfg["clientVersion"],
-                },
-                **proxy_kwargs
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(raw_url, download=False)
+    except yt_dlp.utils.DownloadError as de:
+        err_msg = str(de)
+        if "Sign in to confirm" in err_msg or "bot" in err_msg.lower():
+            raise HTTPException(
+                status_code=403,
+                detail="YouTube requested authentication. Please configure YOUTUBE_COOKIES or PROXY_URL in your deployment."
             )
+        raise HTTPException(status_code=400, detail=f"yt-dlp extraction error: {err_msg}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch video details: {str(e)}")
 
-            if resp.status_code != 200:
-                print(f"Innertube {client_cfg['clientName']} returned {resp.status_code}")
-                continue
+    if not info:
+        raise HTTPException(status_code=404, detail="No video or playlist found.")
 
-            data = resp.json()
-            status = data.get("playabilityStatus", {}).get("status", "")
-            if status == "OK":
-                print(f"Innertube success with {client_cfg['clientName']}")
-                return data
-            print(f"Innertube {client_cfg['clientName']}: playabilityStatus={status}")
+    # Handle Search Queries & Single Video Results
+    if info.get("_type") == "playlist" or "entries" in info:
+        entries = [e for e in (info.get("entries") or []) if e]
 
-        except Exception as e:
-            print(f"Innertube {client_cfg['clientName']} failed: {e}")
-            continue
+        # If it was a search query or a playlist with 1 track that needs full format inspection
+        if (raw_url.startswith("ytsearch") or "search" in str(info.get("extractor", ""))) and len(entries) >= 1:
+            first_entry = entries[0]
+            first_url = first_entry.get("url") or f"https://www.youtube.com/watch?v={first_entry.get('id')}"
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(first_url, download=False)
+        elif info.get("_type") == "playlist" or len(entries) > 1:
+            tracks = []
+            for e in entries:
+                v_id = e.get("id")
+                if not v_id:
+                    continue
+                dur = e.get("duration")
+                author_name = e.get("uploader") or e.get("channel") or info.get("uploader") or "Unknown Artist"
+                thumb = e.get("thumbnail") or f"https://i.ytimg.com/vi/{v_id}/hqdefault.jpg"
+                dur_fmt = format_duration(dur)
+                tracks.append({
+                    "id": v_id,
+                    "title": e.get("title", "Untitled Track"),
+                    "uploader": author_name,
+                    "author": author_name,
+                    "duration": dur,
+                    "duration_formatted": dur_fmt,
+                    "length_formatted": dur_fmt,
+                    "thumbnail": thumb,
+                    "thumbnail_url": thumb,
+                    "url": f"https://www.youtube.com/watch?v={v_id}",
+                })
 
-    return None
+            author_str = info.get("uploader") or info.get("channel") or "Unknown Uploader"
+            return {
+                "is_playlist": True,
+                "id": info.get("id") or "playlist",
+                "title": info.get("title") or "YouTube Playlist",
+                "uploader": author_str,
+                "author": author_str,
+                "track_count": len(tracks),
+                "total_tracks": len(tracks),
+                "playlist_url": raw_url,
+                "url": raw_url,
+                "tracks": tracks,
+            }
 
+    # Handle Single Video response
+    video_id = info.get("id") or "video"
+    title = info.get("title") or "YouTube Video"
+    uploader = info.get("uploader") or info.get("channel") or "Unknown"
+    duration = info.get("duration") or 0
+    dur_formatted = format_duration(duration)
+    views = info.get("view_count") or 0
+    thumbnail = info.get("thumbnail") or f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
+    description = info.get("description", "")
 
-def innertube_to_response(data: dict, video_id: str) -> dict:
-    """Convert Innertube player response to our standard API format."""
-    details = data.get("videoDetails", {})
-    title = details.get("title", "Unknown Title")
-    author = details.get("author", "Unknown")
-    duration = int(details.get("lengthSeconds", 0))
-    views = int(details.get("viewCount", 0))
-    thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
-
-    streaming = data.get("streamingData", {})
-    adaptive = streaming.get("adaptiveFormats", [])
-    combined = streaming.get("formats", [])
-
-    seen_res = set()
+    # Parse and categorize formats
+    formats = info.get("formats", [])
+    seen_resolutions = set()
     video_streams = []
-    for f in adaptive + combined:
-        height = f.get("height")
-        if not height:
+
+    # Priority target resolutions
+    res_priority = [2160, 1440, 1080, 720, 480, 360, 240, 144]
+
+    for target_h in res_priority:
+        matching = [
+            f for f in formats
+            if f.get("vcodec") != "none" and (f.get("height") == target_h or (target_h == 2160 and (f.get("height") or 0) >= 2160))
+        ]
+        if not matching:
             continue
-        mime = f.get("mimeType", "")
-        if "video" not in mime:
-            continue
-        res_str = f"{height}p"
-        if res_str not in seen_res:
-            seen_res.add(res_str)
-            filesize = f.get("contentLength")
-            try:
-                filesize = int(filesize) if filesize else 0
-            except Exception:
-                filesize = 0
+
+        matching.sort(key=lambda x: (x.get("filesize") or x.get("filesize_approx") or (x.get("tbr") or 0)), reverse=True)
+        best_f = matching[0]
+
+        res_label = f"{target_h}p"
+        if target_h >= 2160:
+            quality_desc = f"{res_label} (4K Ultra HD)"
+        elif target_h >= 1440:
+            quality_desc = f"{res_label} (2K Quad HD)"
+        elif target_h >= 1080:
+            quality_desc = f"{res_label} (Full HD)"
+        elif target_h >= 720:
+            quality_desc = f"{res_label} (HD)"
+        else:
+            quality_desc = f"{res_label} (SD)"
+
+        if res_label not in seen_resolutions:
+            seen_resolutions.add(res_label)
+            f_size = best_f.get("filesize") or best_f.get("filesize_approx")
+            is_approx = False
+            if not f_size and duration and best_f.get("tbr"):
+                f_size = int((best_f["tbr"] * 1000 / 8) * duration)
+                is_approx = True
+
+            fps_val = best_f.get("fps") or 30
+
             video_streams.append({
-                "itag": str(f.get("itag", res_str)),
-                "resolution": res_str,
-                "fps": f.get("fps", 30),
-                "mime_type": "video/mp4",
+                "itag": str(best_f.get("format_id")),
+                "resolution": res_label,
+                "label": quality_desc,
+                "quality": res_label,
                 "extension": "mp4",
-                "filesize": filesize,
-                "filesize_formatted": format_size(filesize) if filesize else "HD Stream",
-                "has_audio": True,
-                "direct_url": f.get("url"),
+                "filesize": f_size,
+                "filesize_formatted": format_size(f_size, is_approx=is_approx),
+                "has_audio": best_f.get("acodec") != "none",
+                "is_approx_size": is_approx,
+                "fps": fps_val,
+                "direct_url": best_f.get("url") if best_f.get("acodec") != "none" and best_f.get("ext") == "mp4" else None,
             })
 
-    video_streams.sort(
-        key=lambda x: int(re.search(r'(\d+)', x['resolution']).group(1)) if re.search(r'(\d+)', x['resolution']) else 0,
-        reverse=True
-    )
-
-    approx_320 = int((320 * 1000 / 8) * duration) if duration else 0
-    approx_192 = int((192 * 1000 / 8) * duration) if duration else 0
-    approx_128 = int((128 * 1000 / 8) * duration) if duration else 0
-    audio_streams = [
-        {"itag": "bestaudio",     "abr": "320kbps", "mime_type": "audio/mp3", "extension": "mp3",
-         "filesize": approx_320, "filesize_formatted": format_size(approx_320, is_approx=True) if duration else "320 kbps MP3"},
-        {"itag": "bestaudio_192", "abr": "192kbps", "mime_type": "audio/mp3", "extension": "mp3",
-         "filesize": approx_192, "filesize_formatted": format_size(approx_192, is_approx=True) if duration else "192 kbps MP3"},
-        {"itag": "bestaudio_128", "abr": "128kbps", "mime_type": "audio/mp3", "extension": "mp3",
-         "filesize": approx_128, "filesize_formatted": format_size(approx_128, is_approx=True) if duration else "128 kbps MP3"},
+    # High quality MP3 audio options with full abr + bitrate aliases
+    audio_bitrates = [
+        (320, "320 kbps (Ultra HD MP3)"),
+        (256, "256 kbps (High Quality MP3)"),
+        (192, "192 kbps (Standard Quality MP3)"),
+        (128, "128 kbps (Compact MP3)"),
     ]
+
+    audio_streams = []
+    for kbps, label in audio_bitrates:
+        approx_bytes = int((kbps * 1000 / 8) * duration) if duration else None
+        audio_streams.append({
+            "itag": f"{kbps}k",
+            "abr": f"{kbps}kbps",
+            "bitrate": f"{kbps} kbps",
+            "label": label,
+            "extension": "mp3",
+            "filesize": approx_bytes,
+            "filesize_formatted": format_size(approx_bytes, is_approx=True),
+            "is_approx_size": True,
+        })
 
     return {
         "is_playlist": False,
+        "id": video_id,
         "title": title,
-        "author": author,
-        "length_seconds": duration,
-        "length_formatted": format_duration(duration),
+        "author": uploader,
+        "uploader": uploader,
+        "duration": duration,
+        "duration_formatted": dur_formatted,
+        "length_formatted": dur_formatted,
         "views": views,
-        "thumbnail_url": thumbnail_url,
+        "views_formatted": format_views(views),
+        "thumbnail": thumbnail,
+        "thumbnail_url": thumbnail,
+        "description": description[:500] if description else "",
         "video_streams": video_streams,
         "audio_streams": audio_streams,
-        "_source": "innertube",
     }
 
 
-def invidious_get_info(video_id: str) -> Optional[dict]:
-    """Fetch video info from Invidious API — last cookie-free fallback."""
-    if not HAS_HTTPX:
-        return None
+# ── Endpoint: SSE Single Video / Audio Download ───────────────────────────────
+@app.get("/api/download-single-sse")
+async def download_single_sse(
+    url: str = Query(...),
+    itag: str = Query(...),
+    audio_only: bool = Query(False),
+    download_id: Optional[str] = Query(None)
+):
+    """Real-time SSE download worker using yt-dlp with live progress hook."""
+    cleanup_old_files()
+    raw_url = clean_url(url)
+    current_download_id = download_id or f"dl_{uuid.uuid4().hex[:8]}"
+    cancel_event = threading.Event()
+    ACTIVE_DOWNLOADS[current_download_id] = cancel_event
 
-    proxy_kwargs = {"proxy": PROXY_URL} if PROXY_URL else {}
-    fields = "title,author,lengthSeconds,viewCount,videoThumbnails,adaptiveFormats,formatStreams"
+    msg_queue: queue.Queue = queue.Queue()
 
-    # Shuffle to avoid hammering one instance
-    shuffled = INVIDIOUS_INSTANCES.copy()
-    random.shuffle(shuffled)
-
-    for instance in shuffled:
+    def run_download():
+        temp_dir = tempfile.mkdtemp(prefix="streamcraft_single_")
         try:
-            url = f"{instance}/api/v1/videos/{video_id}?fields={fields}"
-            resp = httpx.get(url, timeout=8, follow_redirects=True, **proxy_kwargs)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("title"):
-                    print(f"Invidious success: {instance}")
-                    return {"_from_invidious": True, **data}
-        except Exception as e:
-            print(f"Invidious {instance} failed: {e}")
-            continue
-    return None
+            def progress_hook(d):
+                if cancel_event.is_set():
+                    raise yt_dlp.utils.DownloadCancelled("Download cancelled by user.")
 
+                status = d.get("status")
+                if status == "downloading":
+                    downloaded = d.get("downloaded_bytes", 0)
+                    total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                    speed = d.get("speed")
+                    eta = d.get("eta")
 
-def invidious_info_to_response(data: dict, url: str) -> dict:
-    """Convert Invidious API response to our standard format."""
-    title = data.get("title", "Unknown Title")
-    author = data.get("author", "Unknown")
-    duration = data.get("lengthSeconds", 0)
-    views = data.get("viewCount", 0)
-    thumbnails = data.get("videoThumbnails", [])
-    thumbnail = next((t["url"] for t in thumbnails if t.get("quality") in ["maxres", "high", "medium"]), "")
-    if thumbnail and thumbnail.startswith("/"):
-        thumbnail = f"https://i.ytimg.com{thumbnail}"
-    seen_res, video_streams = set(), []
-    for f in data.get("adaptiveFormats", []):
-        height = f.get("resolution", "").replace("p", "")
-        if not height:
-            continue
-        try:
-            height = int(height)
-        except Exception:
-            continue
-        if "video" not in f.get("type", ""):
-            continue
-        res_str = f"{height}p"
-        if res_str not in seen_res:
-            seen_res.add(res_str)
-            filesize = int(f.get("clen") or 0)
-            video_streams.append({
-                "itag": f.get("itag", res_str), "resolution": res_str, "fps": f.get("fps", 30),
-                "mime_type": "video/mp4", "extension": "mp4", "filesize": filesize,
-                "filesize_formatted": format_size(filesize) if filesize else "HD Stream", "has_audio": True,
-                "direct_url": f.get("url"),
+                    percent = 0
+                    if total > 0:
+                        percent = min(99.0, max(1.0, (downloaded / total) * 100))
+
+                    speed_str = format_size(int(speed)) + "/s" if speed else "Calculating..."
+                    eta_str = f"{int(eta)}s" if eta is not None else "Calculating..."
+
+                    msg_queue.put({
+                        "type": "progress",
+                        "percent": round(percent, 1),
+                        "receivedMB": f"{downloaded / (1024 * 1024):.1f}",
+                        "totalMB": f"{total / (1024 * 1024):.1f}" if total else "",
+                        "speed": speed_str,
+                        "eta": eta_str,
+                        "status": f"Downloading stream ({round(percent, 1)}%)...",
+                    })
+
+                elif status == "finished":
+                    msg_queue.put({
+                        "type": "converting",
+                        "percent": 95,
+                        "speed": "Processing",
+                        "eta": "Few seconds",
+                        "status": "Merging / Converting media into final format...",
+                    })
+
+            # Base options
+            ydl_opts = get_base_ydl_opts({
+                "outtmpl": os.path.join(temp_dir, "%(title).200B.%(ext)s"),
+                "progress_hooks": [progress_hook],
+                "noplaylist": True,
             })
-    video_streams.sort(key=lambda x: int(re.search(r'(\d+)', x['resolution']).group(1) or 0), reverse=True)
-    a320 = int((320*1000/8)*duration) if duration else 0
-    a192 = int((192*1000/8)*duration) if duration else 0
-    a128 = int((128*1000/8)*duration) if duration else 0
-    return {
-        "is_playlist": False, "title": title, "author": author,
-        "length_seconds": duration, "length_formatted": format_duration(duration),
-        "views": views, "thumbnail_url": thumbnail,
-        "video_streams": video_streams,
-        "audio_streams": [
-            {"itag": "bestaudio",     "abr": "320kbps", "mime_type": "audio/mp3", "extension": "mp3", "filesize": a320, "filesize_formatted": format_size(a320, is_approx=True) if duration else "320 kbps MP3"},
-            {"itag": "bestaudio_192", "abr": "192kbps", "mime_type": "audio/mp3", "extension": "mp3", "filesize": a192, "filesize_formatted": format_size(a192, is_approx=True) if duration else "192 kbps MP3"},
-            {"itag": "bestaudio_128", "abr": "128kbps", "mime_type": "audio/mp3", "extension": "mp3", "filesize": a128, "filesize_formatted": format_size(a128, is_approx=True) if duration else "128 kbps MP3"},
-        ],
-        "_source": "invidious",
-    }
 
+            if audio_only:
+                bitrate_match = re.search(r"(\d+)k?", itag)
+                desired_bitrate = bitrate_match.group(1) if bitrate_match else "192"
 
+                ydl_opts.update({
+                    "format": "bestaudio/best",
+                    "postprocessors": [{
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": desired_bitrate,
+                    }],
+                })
+            else:
+                if itag and itag.isdigit():
+                    ydl_opts["format"] = f"{itag}+bestaudio/bestvideo+bestaudio/best"
+                else:
+                    ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 
-@app.post("/api/info")
-def get_video_info(req: VideoInfoRequest):
-    """Extract metadata and available streams for video, audio, or playlist."""
-    if not req.url:
-        raise HTTPException(status_code=400, detail="Please provide a valid YouTube or YouTube Music URL.")
+                ydl_opts["merge_output_format"] = "mp4"
 
-    url = clean_url(req.url)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info_dict = ydl.extract_info(raw_url, download=True)
+                title = info_dict.get("title", "media")
 
-    # 1. In-Memory Cache check (Instant 0.001s response for repeated/retried URLs)
-    now = time.time()
-    if url in INFO_CACHE:
-        cached_time, cached_data = INFO_CACHE[url]
-        if now - cached_time < 900:  # 15 minutes TTL
-            print(f"[cache] Instant response for {url}")
-            return cached_data
+            downloaded_files = [
+                os.path.join(temp_dir, f) for f in os.listdir(temp_dir)
+                if not f.endswith(".part") and not f.endswith(".ytdl")
+            ]
 
-    is_playlist = ('list=' in url and 'watch?v=' not in url) or ('playlist?list=' in url)
+            if not downloaded_files:
+                raise RuntimeError("Media file was not created by yt-dlp.")
 
-    # 2. Fast-Path for Single Videos: Innertube (~300ms ultra-fast response)
-    if not is_playlist and HAS_HTTPX:
-        video_id = extract_video_id(url)
-        if video_id:
-            print(f"[fast-path] Trying Innertube for {video_id}...")
-            innertube_data = innertube_get_info(video_id)
-            if innertube_data:
-                res = innertube_to_response(innertube_data, video_id)
-                INFO_CACHE[url] = (now, res)
-                return res
+            final_filepath = downloaded_files[0]
+            ext = os.path.splitext(final_filepath)[1].lstrip(".").lower() or ("mp3" if audio_only else "mp4")
+            safe_title = sanitize_filename(title)
+            final_filename = f"{safe_title}.{ext}"
 
-    # 3. Comprehensive Path: yt-dlp (handles playlists, restricted streams, etc.)
-    if HAS_YTDLP:
-        try:
-            info = _ytdlp_extract_info(url)
-            if info is not None:
-                # Playlist or radio mix
-                if info.get('_type') == 'playlist' or 'entries' in info:
-                    entries = list(info.get('entries', []))
-                    tracks = []
-                    for e in entries[:50]:
-                        if e:
-                            track_id = e.get('id')
-                            tracks.append({
-                                "id": track_id,
-                                "title": e.get('title', 'Unknown Track'),
-                                "author": e.get('uploader') or e.get('channel', 'Unknown Artist'),
-                                "duration_formatted": format_duration(e.get('duration', 0)),
-                                "url": f"https://www.youtube.com/watch?v={track_id}",
-                                "thumbnail_url": e.get('thumbnail') or (
-                                    f"https://i.ytimg.com/vi/{track_id}/hqdefault.jpg" if track_id else None
-                                )
-                            })
-                    res = {
-                        "is_playlist": True,
-                        "title": info.get('title', 'YouTube Playlist'),
-                        "author": info.get('uploader') or 'YouTube / YouTube Music',
-                        "track_count": len(entries),
-                        "tracks": tracks,
-                        "playlist_url": url,
-                    }
-                    INFO_CACHE[url] = (now, res)
-                    return res
+            file_id = str(uuid.uuid4())
+            file_size = os.path.getsize(final_filepath)
 
-                # Single video
-                title = info.get('title', 'Unknown Title')
-                author = info.get('uploader') or info.get('channel', 'Unknown Channel')
-                duration = info.get('duration', 0)
-                views = info.get('view_count', 0)
-                thumbnail = info.get('thumbnail', '')
-                raw_formats = info.get('formats', [])
+            SINGLE_FILE_STORAGE[file_id] = {
+                "filepath": final_filepath,
+                "filename": final_filename,
+                "mimetype": "audio/mpeg" if ext == "mp3" else "video/mp4",
+                "created_at": time.time(),
+                "temp_dir": temp_dir,
+            }
 
-                seen_res = set()
-                video_streams = []
-                for f in reversed(raw_formats):
-                    height = f.get('height')
-                    vcodec = f.get('vcodec', 'none')
-                    if height and vcodec != 'none':
-                        res_str = f"{height}p"
-                        if res_str not in seen_res:
-                            seen_res.add(res_str)
-                            filesize = f.get('filesize') or f.get('filesize_approx')
-                            is_approx = False
-                            if not filesize and duration:
-                                tbr = f.get('tbr') or f.get('vbr') or 0
-                                if tbr:
-                                    filesize = int(((tbr + 192) * 1000 / 8) * duration)
-                                    is_approx = True
-                            video_streams.append({
-                                "itag": f.get('format_id'),
-                                "resolution": res_str,
-                                "fps": f.get('fps') or 30,
-                                "mime_type": "video/mp4",
-                                "extension": "mp4",
-                                "filesize": filesize or 0,
-                                "filesize_formatted": format_size(filesize, is_approx=is_approx) if filesize else "HD Stream",
-                                "has_audio": True,
-                            })
+            msg_queue.put({
+                "type": "complete",
+                "file_id": file_id,
+                "filename": final_filename,
+                "size_formatted": format_size(file_size),
+            })
 
-                def parse_res(item):
-                    match = re.search(r'(\d+)', item.get('resolution') or '')
-                    return int(match.group(1)) if match else 0
-
-                # If only 1 progressive stream was found (e.g. 360p), ensure standard HD options (1080p, 720p, 480p) are available
-                available_res = {s['resolution'] for s in video_streams}
-                if len(video_streams) <= 1 and duration:
-                    standards = [
-                        ("1080p", 3500, "1080p"),
-                        ("720p", 1800, "720p"),
-                        ("480p", 900, "480p"),
-                        ("360p", 500, "360p"),
-                    ]
-                    for res_name, kbps, tag in standards:
-                        if res_name not in available_res:
-                            approx_bytes = int((kbps * 1000 / 8) * duration)
-                            video_streams.append({
-                                "itag": tag,
-                                "resolution": res_name,
-                                "fps": 30,
-                                "mime_type": "video/mp4",
-                                "extension": "mp4",
-                                "filesize": approx_bytes,
-                                "filesize_formatted": format_size(approx_bytes, is_approx=True),
-                                "has_audio": True,
-                            })
-
-                video_streams.sort(key=parse_res, reverse=True)
-
-                approx_audio = int((192 * 1000 / 8) * duration) if duration else 0
-                audio_streams = [
-                    {"itag": "bestaudio",     "abr": "320kbps", "mime_type": "audio/mp3", "extension": "mp3",
-                     "filesize": int((320 * 1000 / 8) * duration) if duration else 0,
-                     "filesize_formatted": format_size(int((320 * 1000 / 8) * duration), is_approx=True) if duration else "320 kbps MP3"},
-                    {"itag": "bestaudio_192", "abr": "192kbps", "mime_type": "audio/mp3", "extension": "mp3",
-                     "filesize": approx_audio,
-                     "filesize_formatted": format_size(approx_audio, is_approx=True) if duration else "192 kbps MP3"},
-                    {"itag": "bestaudio_128", "abr": "128kbps", "mime_type": "audio/mp3", "extension": "mp3",
-                     "filesize": int((128 * 1000 / 8) * duration) if duration else 0,
-                     "filesize_formatted": format_size(int((128 * 1000 / 8) * duration), is_approx=True) if duration else "128 kbps MP3"},
-                ]
-
-                res = {
-                    "is_playlist": False,
-                    "title": title,
-                    "author": author,
-                    "length_seconds": duration,
-                    "length_formatted": format_duration(duration),
-                    "views": views,
-                    "thumbnail_url": thumbnail,
-                    "video_streams": video_streams,
-                    "audio_streams": audio_streams,
-                }
-                INFO_CACHE[url] = (now, res)
-                return res
-        except HTTPException:
-            raise
+        except yt_dlp.utils.DownloadCancelled:
+            msg_queue.put({"type": "error", "message": "Download was cancelled."})
+            shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception as e:
-            print(f"[yt-dlp] All strategies exhausted: {str(e)[:200]}")
+            msg_queue.put({"type": "error", "message": str(e)})
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        finally:
+            ACTIVE_DOWNLOADS.pop(current_download_id, None)
 
-    # 4. Fallback: Invidious public instances
-    if HAS_HTTPX:
-        video_id = extract_video_id(url)
-        if video_id:
-            print(f"[invidious] Trying for {video_id}...")
-            inv_data = invidious_get_info(video_id)
-            if inv_data:
-                res = invidious_info_to_response(inv_data, url)
-                INFO_CACHE[url] = (now, res)
-                return res
+    t = threading.Thread(target=run_download, daemon=True)
+    t.start()
 
-    # ── All engines failed — give actionable tips ─────────────────────────────
-    tips = []
-    if not PROXY_URL:
-        tips.append("Set PROXY_URL in Render → Environment Variables (residential proxy fixes this instantly)")
-    if not PO_TOKEN:
-        tips.append("Set PO_TOKEN from yt-dlp wiki (Proof of Origin token)")
-    if not COOKIE_FILES:
-        tips.append("Set YOUTUBE_COOKIES in Render → Environment Variables")
+    async def event_generator():
+        while True:
+            try:
+                msg = msg_queue.get(timeout=45.0)
+                yield f"data: {json.dumps(msg)}\n\n"
+                if msg.get("type") in ("complete", "error"):
+                    break
+            except queue.Empty:
+                yield ": keepalive\n\n"
 
-    tip_str = " | ".join(tips) if tips else "All bypass methods configured — YouTube may have updated bot detection"
-    raise HTTPException(
-        status_code=400,
-        detail=f"All engines failed. YouTube is blocking this server's IP. Fix: {tip_str}"
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
     )
 
 
-
-
-@app.get("/api/download-single-sse")
-async def download_single_sse(
-    request: Request,
-    url: str = Query(..., description="YouTube video URL"),
-    itag: str = Query(..., description="Selected stream itag or format_id"),
-    audio_only: bool = Query(False, description="Whether to download audio only"),
-    download_id: Optional[str] = Query(None, description="Unique download session identifier")
-):
-    """
-    Live SSE single video/audio download engine:
-    Emits real-time progress events from the server to the frontend, converts audio/merges video,
-    and returns a file_id ready for instantaneous browser transfer.
-    Instantly cancels background download process if client aborts or disconnects.
-    """
-    clean_target_url = clean_url(url)
-    cancel_event = threading.Event()
-    if download_id:
-        ACTIVE_DOWNLOADS[download_id] = cancel_event
-
-    async def event_stream():
-        tmp_dir = tempfile.mkdtemp(prefix="ytdl_sse_single_")
-        out_template = os.path.join(tmp_dir, "%(title)s.%(ext)s")
-        has_ffmpeg = bool(shutil.which('ffmpeg'))
-        msg_queue = queue.Queue()
-
-        yield f"data: {json.dumps({'type': 'init', 'percent': 5, 'speed': 'Connecting...', 'eta': 'Calculating...', 'status': 'Connecting to YouTube stream...'})}\n\n"
-
-        def _build_fmt(ydl_opts_: dict):
-            if audio_only:
-                ydl_opts_['format'] = 'bestaudio/best'
-                if has_ffmpeg:
-                    ydl_opts_['postprocessors'] = [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '192',
-                    }]
-            else:
-                if itag.isdigit():
-                    fmt = f"{itag}+bestaudio/best/{itag}/best" if has_ffmpeg else f"{itag}/best"
-                elif itag in ["1080p", "720p", "480p", "360p", "240p", "144p"]:
-                    h = itag.replace("p", "")
-                    fmt = f"bestvideo[height<={h}]+bestaudio/best[height<={h}]/bestvideo+bestaudio/best" if has_ffmpeg else f"best[height<={h}]/best"
-                else:
-                    fmt = "bestvideo+bestaudio/best" if has_ffmpeg else "best"
-                ydl_opts_['format'] = fmt
-                ydl_opts_['merge_output_format'] = 'mp4'
-
-        def progress_hook(d):
-            if cancel_event.is_set():
-                raise Exception("Download aborted by user")
-
-            status = d.get('status')
-            if status == 'downloading':
-                total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
-                downloaded = d.get('downloaded_bytes', 0)
-                speed = d.get('speed') or 0
-                eta = d.get('eta') or 0
-
-                pct = min(88, max(5, int((downloaded / total) * 88))) if total else 25
-
-                if speed >= 1024 * 1024:
-                    speed_str = f"{speed / (1024 * 1024):.1f} MB/s"
-                elif speed > 0:
-                    speed_str = f"{speed / 1024:.0f} KB/s"
-                else:
-                    speed_str = "Downloading..."
-
-                eta_str = f"~{int(eta)}s left" if eta else "Calculating..."
-                down_mb = f"{downloaded / (1024 * 1024):.1f}"
-                tot_mb = f"{total / (1024 * 1024):.1f}" if total else ""
-
-                msg_queue.put({
-                    'type': 'progress',
-                    'percent': pct,
-                    'receivedMB': down_mb,
-                    'totalMB': tot_mb,
-                    'speed': speed_str,
-                    'eta': eta_str,
-                    'status': '⚡ Downloading high-speed stream...' if not audio_only else '⚡ Downloading audio stream...',
-                })
-            elif status == 'finished':
-                msg_queue.put({
-                    'type': 'converting',
-                    'percent': 92,
-                    'speed': 'Processing',
-                    'eta': 'Almost done',
-                    'status': '✨ Converting to high-bitrate MP3...' if audio_only else '✨ Finalizing & packaging video...'
-                })
-
-        def worker():
-            try:
-                strategies_dl = []
-
-                # Multi-strategy downloading for robustness
-                s1 = get_base_ydl_opts(use_cookies=True)
-                s1.pop('proxy', None)
-                s1['outtmpl'] = out_template
-                s1['progress_hooks'] = [progress_hook]
-                _build_fmt(s1)
-                strategies_dl.append(("direct-with-cookies", s1))
-
-                # Strategy 2: Clean no-cookies mode (bypasses expired/flagged cookie issues)
-                s2 = get_base_ydl_opts(use_cookies=False)
-                s2.pop('proxy', None)
-                s2['outtmpl'] = out_template
-                s2['progress_hooks'] = [progress_hook]
-                _build_fmt(s2)
-                strategies_dl.append(("clean-no-cookies", s2))
-
-                # Strategy 3: Multi-client fallback
-                s3 = get_base_ydl_opts(use_cookies=False)
-                s3.pop('proxy', None)
-                s3['outtmpl'] = out_template
-                s3['progress_hooks'] = [progress_hook]
-                s3['extractor_args'] = {'youtube': {'player_client': ['android', 'ios', 'web', 'mweb']}}
-                _build_fmt(s3)
-                strategies_dl.append(("multi-client-no-cookies", s3))
-
-                # Strategy 4: Proxy Fallback (if direct connection encounters bot error)
-                if PROXY_URL:
-                    s4 = get_base_ydl_opts(use_cookies=False)
-                    s4['proxy'] = PROXY_URL
-                    s4['outtmpl'] = out_template
-                    s4['progress_hooks'] = [progress_hook]
-                    _build_fmt(s4)
-                    strategies_dl.append(("proxy-fallback", s4))
-
-                info_res = None
-                dl_file = None
-                for strat_name, opts in strategies_dl:
-                    if cancel_event.is_set():
-                        return
-                    try:
-                        with yt_dlp.YoutubeDL(opts) as ydl:
-                            info_res = ydl.extract_info(clean_target_url, download=True)
-                            dl_file = ydl.prepare_filename(info_res)
-
-                        if audio_only:
-                            base_name = os.path.splitext(dl_file)[0]
-                            mp3_path = base_name + ".mp3"
-                            if os.path.exists(mp3_path):
-                                dl_file = mp3_path
-
-                        if not os.path.exists(dl_file):
-                            files = os.listdir(tmp_dir)
-                            dl_file = os.path.join(tmp_dir, files[0]) if files else None
-
-                        if dl_file and os.path.exists(dl_file):
-                            break
-                    except Exception as e:
-                        if cancel_event.is_set() or "aborted" in str(e).lower() or "cancelled" in str(e).lower():
-                            print(f"[single-sse] Backend download gracefully cancelled.")
-                            return
-                        print(f"[single-sse] Strategy {strat_name} failed: {e}")
-                        continue
-
-                if cancel_event.is_set():
-                    return
-
-                if not dl_file or not os.path.exists(dl_file):
-                    msg_queue.put({'type': 'error', 'message': 'Download failed: Output file not created.'})
-                    return
-
-                msg_queue.put({'type': 'done', 'file_path': dl_file, 'info': info_res})
-            except Exception as e:
-                if not cancel_event.is_set():
-                    msg_queue.put({'type': 'error', 'message': str(e)})
-
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
-
-        try:
-            while t.is_alive() or not msg_queue.empty():
-                if await request.is_disconnected():
-                    print("[sse] Client disconnected. Halting background download immediately...")
-                    cancel_event.set()
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                    if download_id:
-                        ACTIVE_DOWNLOADS.pop(download_id, None)
-                    return
-
-                try:
-                    msg = msg_queue.get(timeout=0.2)
-                    mtype = msg.get('type')
-                    if mtype == 'done':
-                        dl_file = msg['file_path']
-                        info_res = msg.get('info') or {}
-                        raw_title = info_res.get('title', 'media')
-                        safe_title = sanitize_filename(raw_title)
-                        ext = "mp3" if audio_only else (os.path.splitext(dl_file)[1].lstrip('.') or 'mp4')
-                        final_filename = f"{safe_title}.{ext}"
-                        filesize = os.path.getsize(dl_file)
-
-                        file_id = str(uuid.uuid4())
-                        SINGLE_FILE_STORAGE[file_id] = {
-                            'path': dl_file,
-                            'tmp_dir': tmp_dir,
-                            'filename': final_filename,
-                            'size': filesize,
-                            'created_at': time.time(),
-                        }
-
-                        yield f"data: {json.dumps({'type': 'complete', 'percent': 100, 'file_id': file_id, 'filename': final_filename, 'size_formatted': format_size(filesize), 'status': '🎉 Download Complete!'})}\n\n"
-                        if download_id:
-                            ACTIVE_DOWNLOADS.pop(download_id, None)
-                        return
-                    elif mtype == 'error':
-                        shutil.rmtree(tmp_dir, ignore_errors=True)
-                        yield f"data: {json.dumps({'type': 'error', 'message': msg.get('message', 'Download error')})}\n\n"
-                        if download_id:
-                            ACTIVE_DOWNLOADS.pop(download_id, None)
-                        return
-                    else:
-                        yield f"data: {json.dumps(msg)}\n\n"
-                except queue.Empty:
-                    pass
-        finally:
-            if cancel_event.is_set():
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            if download_id:
-                ACTIVE_DOWNLOADS.pop(download_id, None)
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-
-@app.post("/api/cancel-download")
-def cancel_download(download_id: str = Query(...)):
-    """Explicitly terminate an active download session on the server and clean up disk."""
-    event = ACTIVE_DOWNLOADS.pop(download_id, None)
-    if event:
-        event.set()
-        return {"status": "ok", "message": "Download cancelled and backend process terminated"}
-    return {"status": "ok", "message": "Session not active or already completed"}
-
-
-@app.get("/api/proxy-pipe")
-async def proxy_pipe(
-    stream_url: str = Query(..., description="Direct GoogleVideo or CDN stream URL"),
-    title: str = Query("video", description="Video or audio title"),
-    ext: str = Query("mp4", description="File extension")
-):
-    """
-    Ultra-fast zero-disk stream pipe:
-    Directly pipes media chunks straight from Google CDN to user browser with ZERO server disk write.
-    Starts downloading immediately in 0.1s at maximum network speed.
-    """
-    safe_ascii = sanitize_filename(title) + f".{ext}"
-    utf8_encoded = urllib.parse.quote(f"{title}.{ext}")
-
-    async def stream_generator():
-        proxy_str = PROXY_URL if PROXY_URL else None
-        async with httpx.AsyncClient(proxy=proxy_str, follow_redirects=True, timeout=120.0) as client:
-            async with client.stream("GET", stream_url) as resp:
-                if resp.status_code != 200:
-                    yield b""
-                    return
-                async for chunk in resp.aiter_bytes(chunk_size=1024 * 256):
-                    yield chunk
-
-    headers = {
-        "Content-Disposition": f'attachment; filename="{safe_ascii}"; filename*=UTF-8\'\'{utf8_encoded}',
-        "Access-Control-Expose-Headers": "Content-Disposition",
-    }
-    mime = "audio/mpeg" if ext == "mp3" else f"video/{ext}"
-    return StreamingResponse(stream_generator(), headers=headers, media_type=mime)
-
-
+# ── Endpoint: Download Stored Single File ─────────────────────────────────────
 @app.get("/api/get-single-file")
-def get_single_file(file_id: str = Query(...)):
-    """Serve the downloaded single video/audio file and clean up temp folder."""
-    item = SINGLE_FILE_STORAGE.pop(file_id, None)
-    if not item or not os.path.exists(item['path']):
-        raise HTTPException(status_code=404, detail="File expired or not found.")
+async def get_single_file(file_id: str = Query(...)):
+    info = SINGLE_FILE_STORAGE.get(file_id)
+    if not info or not os.path.exists(info["filepath"]):
+        raise HTTPException(status_code=404, detail="Requested file was not found or has expired.")
 
-    file_path = item['path']
-    tmp_dir = item['tmp_dir']
-    filename = item['filename']
-    filesize = item['size']
-
-    def iterfile():
-        try:
-            with open(file_path, mode="rb") as f:
-                while chunk := f.read(1024 * 256):
-                    yield chunk
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    safe_ascii = sanitize_filename(os.path.splitext(filename)[0]) + os.path.splitext(filename)[1]
-    utf8_encoded = urllib.parse.quote(filename)
-
-    headers = {
-        "Content-Disposition": f'attachment; filename="{safe_ascii}"; filename*=UTF-8\'\'{utf8_encoded}',
-        "Content-Length": str(filesize),
-        "Access-Control-Expose-Headers": "Content-Disposition, Content-Length",
-    }
-    ext = os.path.splitext(filename)[1].lstrip('.').lower()
-    mime = "audio/mpeg" if ext == "mp3" else f"video/{ext}"
-    return StreamingResponse(iterfile(), headers=headers, media_type=mime)
+    safe_filename = urllib.parse.quote(info["filename"])
+    return FileResponse(
+        path=info["filepath"],
+        filename=info["filename"],
+        media_type=info.get("mimetype", "application/octet-stream"),
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{safe_filename}"
+        }
+    )
 
 
-@app.get("/api/download")
-def download_stream(
-    url: str = Query(..., description="YouTube video URL"),
-    itag: str = Query(..., description="Selected stream itag or format_id"),
-    audio_only: bool = Query(False, description="Whether to download audio only")
+# ── Endpoint: Cancel Download ─────────────────────────────────────────────────
+@app.post("/api/cancel-download")
+async def cancel_download(download_id: str = Query(...)):
+    cancel_event = ACTIVE_DOWNLOADS.get(download_id)
+    if cancel_event:
+        cancel_event.set()
+        return {"status": "cancelled", "download_id": download_id}
+    return {"status": "not_found_or_finished", "download_id": download_id}
+
+
+# ── Endpoint: SSE Playlist ZIP Download ───────────────────────────────────────
+@app.get("/api/playlist-zip-sse")
+async def playlist_zip_sse(
+    url: str = Query(...),
+    audio_only: bool = Query(True),
+    max_tracks: int = Query(50)
 ):
-    """Download single video (MP4) or audio (converted to genuine MP3) and stream."""
-    url = clean_url(url)
+    """Download an entire playlist track by track and stream progress, packaging into a ZIP file."""
+    cleanup_old_files()
+    raw_url = clean_url(url)
+    msg_queue: queue.Queue = queue.Queue()
 
-    if HAS_YTDLP:
+    def run_playlist_task():
+        temp_dir = tempfile.mkdtemp(prefix="streamcraft_playlist_")
         try:
-            tmp_dir = tempfile.mkdtemp(prefix="ytdl_")
-            out_template = os.path.join(tmp_dir, "%(title)s.%(ext)s")
-            has_ffmpeg = bool(shutil.which('ffmpeg'))
+            flat_opts = get_base_ydl_opts({
+                "extract_flat": True,
+                "skip_download": True,
+            })
+            with yt_dlp.YoutubeDL(flat_opts) as ydl:
+                info = ydl.extract_info(raw_url, download=False)
 
-            # Build download format string
-            def _build_fmt(ydl_opts_: dict):
-                if audio_only:
-                    ydl_opts_['format'] = 'bestaudio/best'
-                    if has_ffmpeg:
-                        ydl_opts_['postprocessors'] = [{
-                            'key': 'FFmpegExtractAudio',
-                            'preferredcodec': 'mp3',
-                            'preferredquality': '192',
-                        }]
-                else:
-                    if itag.isdigit():
-                        fmt = f"{itag}+bestaudio/best/{itag}/best" if has_ffmpeg else f"{itag}/best"
-                    elif itag in ["1080p", "720p", "480p", "360p", "240p", "144p"]:
-                        height_val = itag.replace("p", "")
-                        fmt = f"bestvideo[height<={height_val}]+bestaudio/best[height<={height_val}]/best" if has_ffmpeg else f"best[height<={height_val}]/best"
-                    else:
-                        fmt = "bestvideo+bestaudio/best" if has_ffmpeg else "best"
-                    ydl_opts_['format'] = fmt
+            if not info:
+                raise RuntimeError("Failed to fetch playlist entries.")
 
-            # Multi-strategy download
-            strategies_dl = []
+            playlist_title = sanitize_filename(info.get("title") or "YouTube_Playlist")
+            entries = list(info.get("entries") or [])
+            if not entries and "url" in info:
+                entries = [info]
 
-            s1 = get_base_ydl_opts(use_cookies=True)
-            s1['outtmpl'] = out_template
-            _build_fmt(s1)
-            strategies_dl.append(("cookies+optimal", s1))
+            total_tracks = min(len(entries), max_tracks)
+            if total_tracks == 0:
+                raise RuntimeError("Playlist contains 0 tracks.")
 
-            s2 = get_base_ydl_opts(use_cookies=False)
-            s2['outtmpl'] = out_template
-            _build_fmt(s2)
-            strategies_dl.append(("clean-no-cookies", s2))
+            msg_queue.put({
+                "type": "start",
+                "total": total_tracks,
+                "title": playlist_title,
+            })
 
-            s3 = get_base_ydl_opts(use_cookies=False)
-            s3['outtmpl'] = out_template
-            s3['extractor_args'] = {'youtube': {'player_client': ['android', 'ios', 'web', 'mweb']}}
-            _build_fmt(s3)
-            strategies_dl.append(("multi-client-no-cookies", s3))
-
-            if PROXY_URL:
-                s4 = get_base_ydl_opts(use_cookies=False)
-                s4['proxy'] = PROXY_URL
-                s4['outtmpl'] = out_template
-                _build_fmt(s4)
-                strategies_dl.append(("proxy+fallback", s4))
-
-            info = None
-            downloaded_file = None
-
-            for strategy_name, ydl_opts in strategies_dl:
-                try:
-                    print(f"[download] Trying strategy: {strategy_name}")
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                        downloaded_file = ydl.prepare_filename(info)
-
-                    if audio_only:
-                        base_name = os.path.splitext(downloaded_file)[0]
-                        mp3_path = base_name + ".mp3"
-                        if os.path.exists(mp3_path):
-                            downloaded_file = mp3_path
-
-                    if not os.path.exists(downloaded_file):
-                        files = os.listdir(tmp_dir)
-                        downloaded_file = os.path.join(tmp_dir, files[0]) if files else None
-
-                    if downloaded_file and os.path.exists(downloaded_file):
-                        print(f"[download] Success with strategy: {strategy_name}")
-                        break
-
-                except Exception as e:
-                    err_msg = str(e)
-                    is_bot = (
-                        "Sign in to confirm" in err_msg or "bot" in err_msg.lower() or
-                        "cookies" in err_msg.lower()
-                    )
-                    print(f"[download] Strategy '{strategy_name}' failed (bot={is_bot}): {err_msg[:120]}")
-                    if not is_bot:
-                        raise HTTPException(status_code=400, detail=f"Download failed: {err_msg}")
+            track_files = []
+            for i, entry in enumerate(entries[:total_tracks]):
+                if not entry:
+                    continue
+                t_id = entry.get("id")
+                t_title = entry.get("title") or f"Track {i+1}"
+                t_url = f"https://www.youtube.com/watch?v={t_id}" if t_id else entry.get("url")
+                if not t_url:
                     continue
 
-            if not downloaded_file or not os.path.exists(downloaded_file):
-                raise HTTPException(status_code=500, detail="Downloaded file was not found on server.")
-
-            safe_title = sanitize_filename(info.get('title', 'video') if info else 'video')
-            ext = "mp3" if audio_only else (os.path.splitext(downloaded_file)[1].lstrip('.') or 'mp4')
-            raw_filename = f"{(info.get('title', 'video') if info else 'video')}.{ext}"
-            ascii_filename = f"{safe_title}.{ext}"
-            utf8_encoded_filename = urllib.parse.quote(raw_filename)
-            filesize = os.path.getsize(downloaded_file)
-
-            def iterfile():
-                try:
-                    with open(downloaded_file, mode="rb") as f:
-                        while chunk := f.read(1024 * 256):
-                            yield chunk
-                finally:
-                    try:
-                        shutil.rmtree(tmp_dir, ignore_errors=True)
-                    except Exception:
-                        pass
-
-            headers = {
-                "Content-Disposition": f'attachment; filename="{ascii_filename}"; filename*=UTF-8\'\'{utf8_encoded_filename}',
-                "Content-Length": str(filesize),
-                "Access-Control-Expose-Headers": "Content-Disposition, Content-Length",
-            }
-
-            mime_type = "audio/mpeg" if audio_only else f"video/{ext}"
-            return StreamingResponse(iterfile(), headers=headers, media_type=mime_type)
-
-        except HTTPException:
-            raise
-        except Exception as err:
-            raise HTTPException(status_code=500, detail=f"Download error: {str(err)}")
-
-    raise HTTPException(status_code=500, detail="Download engine not available.")
-
-
-@app.get("/api/playlist-zip-sse")
-def playlist_zip_sse(
-    url: str = Query(..., description="YouTube playlist URL"),
-    audio_only: bool = Query(True, description="Download as MP3 (True) or MP4 video (False)"),
-    max_tracks: int = Query(10, description="Max number of tracks to download"),
-):
-    """
-    Stream playlist progress via Server-Sent Events (SSE), download tracks,
-    package into a single ZIP file, and return the download file_id when ready.
-    """
-    clean_target_url = clean_url(url)
-    tracks_limit = min(max(1, max_tracks), 50)  # Safe cap between 1 and 50 tracks
-
-    def event_stream():
-        tmp_dir = tempfile.mkdtemp(prefix="pl_sse_")
-        tracks_dir = os.path.join(tmp_dir, "tracks")
-        os.makedirs(tracks_dir, exist_ok=True)
-
-        try:
-            yield f"data: {json.dumps({'type': 'init', 'status': 'Analyzing playlist tracks...'})}\n\n"
-
-            # 1. Fetch playlist metadata
-            ydl_opts_info = get_base_ydl_opts()
-            ydl_opts_info.update({
-                'skip_download': True,
-                'extract_flat': 'in_playlist',
-            })
-            with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
-                info = ydl.extract_info(clean_target_url, download=False)
-                playlist_title = sanitize_filename(info.get('title') or 'Playlist')
-                entries = list(info.get('entries', []))[:tracks_limit]
-                total_tracks = len(entries)
-
-            if not total_tracks:
-                yield f"data: {json.dumps({'type': 'error', 'message': 'No tracks found in playlist.'})}\n\n"
-                return
-
-            yield f"data: {json.dumps({'type': 'start', 'total': total_tracks, 'playlist_title': playlist_title})}\n\n"
-
-            # 2. Download and convert each track with live progress
-            start_time = time.time()
-            completed_count = 0
-
-            for i, entry in enumerate(entries, start=1):
-                track_id = entry.get('id') if isinstance(entry, dict) else None
-                track_title = (entry.get('title') if isinstance(entry, dict) else None) or f"Track {i}"
-                track_url = f"https://www.youtube.com/watch?v={track_id}" if track_id else clean_target_url
-
-                # Estimate time remaining
-                elapsed = time.time() - start_time
-                if completed_count > 0:
-                    avg_per_track = elapsed / completed_count
-                    remaining_tracks = total_tracks - completed_count
-                    eta_sec = max(1, int(avg_per_track * remaining_tracks))
-                    eta_text = f"~{eta_sec}s left"
-                else:
-                    eta_text = "Calculating ETA..."
-
-                percent = int(((i - 1) / total_tracks) * 90)
-
-                yield f"data: {json.dumps({'type': 'progress', 'current': i, 'total': total_tracks, 'title': track_title, 'percent': percent, 'eta': eta_text})}\n\n"
-
-                has_ffmpeg = bool(shutil.which('ffmpeg'))
-                out_tmpl = os.path.join(tracks_dir, f"{i:02d} - %(title)s.%(ext)s")
-                ydl_opts_dl = get_base_ydl_opts()
-                ydl_opts_dl.update({
-                    'outtmpl': out_tmpl,
-                    'ignoreerrors': True,
+                msg_queue.put({
+                    "type": "progress",
+                    "percent": round(((i) / total_tracks) * 85),
+                    "current": i + 1,
+                    "total": total_tracks,
+                    "title": t_title,
+                    "eta": f"Track {i+1} of {total_tracks}",
                 })
+
+                track_dir = tempfile.mkdtemp(prefix=f"track_{i}_", dir=temp_dir)
+                t_opts = get_base_ydl_opts({
+                    "outtmpl": os.path.join(track_dir, f"{i+1:02d} - %(title).150B.%(ext)s"),
+                    "noplaylist": True,
+                })
+
                 if audio_only:
-                    ydl_opts_dl['format'] = 'bestaudio/best'
-                    if has_ffmpeg:
-                        ydl_opts_dl['postprocessors'] = [{
-                            'key': 'FFmpegExtractAudio',
-                            'preferredcodec': 'mp3',
-                            'preferredquality': '192',
-                        }]
+                    t_opts.update({
+                        "format": "bestaudio/best",
+                        "postprocessors": [{
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": "256",
+                        }],
+                    })
                 else:
-                    ydl_opts_dl['format'] = 'bestvideo[height<=720]+bestaudio/best[height<=720]/best' if has_ffmpeg else 'best[height<=720]/best'
+                    t_opts.update({
+                        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                        "merge_output_format": "mp4",
+                    })
 
                 try:
-                    with yt_dlp.YoutubeDL(ydl_opts_dl) as ydl_track:
-                        ydl_track.download([track_url])
-                    completed_count += 1
-                except Exception as e:
-                    print(f"Error on track {i}: {e}")
+                    with yt_dlp.YoutubeDL(t_opts) as ydl:
+                        ydl.extract_info(t_url, download=True)
 
-            # 3. Zip all downloaded files
-            yield f"data: {json.dumps({'type': 'zipping', 'percent': 95, 'status': 'Packaging tracks into ZIP archive...'})}\n\n"
+                    downloaded = [
+                        os.path.join(track_dir, f) for f in os.listdir(track_dir)
+                        if not f.endswith(".part") and not f.endswith(".ytdl")
+                    ]
+                    if downloaded:
+                        track_files.append(downloaded[0])
+                except Exception as te:
+                    print(f"[Playlist Track {i+1}] Failed: {te}")
+                    continue
 
-            downloaded_files = [f for f in os.listdir(tracks_dir) if os.path.isfile(os.path.join(tracks_dir, f))]
-            if not downloaded_files:
-                yield f"data: {json.dumps({'type': 'error', 'message': 'Could not download tracks from this playlist.'})}\n\n"
-                return
+            if not track_files:
+                raise RuntimeError("Could not download any tracks from the playlist.")
+
+            msg_queue.put({
+                "type": "zipping",
+                "percent": 90,
+                "title": "Packaging ZIP Archive...",
+                "eta": "Compressing...",
+            })
 
             zip_filename = f"{playlist_title}.zip"
-            zip_path = os.path.join(tmp_dir, zip_filename)
+            zip_path = os.path.join(temp_dir, zip_filename)
 
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for f in downloaded_files:
-                    zf.write(os.path.join(tracks_dir, f), arcname=f)
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+                for fpath in track_files:
+                    zipf.write(fpath, arcname=os.path.basename(fpath))
 
             file_id = str(uuid.uuid4())
             zip_size = os.path.getsize(zip_path)
 
-            # Store in memory for download
             ZIP_STORAGE[file_id] = {
-                'path': zip_path,
-                'tmp_dir': tmp_dir,
-                'filename': zip_filename,
-                'size': zip_size,
-                'created_at': time.time(),
+                "filepath": zip_path,
+                "filename": zip_filename,
+                "created_at": time.time(),
+                "temp_dir": temp_dir,
             }
 
-            yield f"data: {json.dumps({'type': 'complete', 'percent': 100, 'file_id': file_id, 'filename': zip_filename, 'size_formatted': format_size(zip_size), 'total_tracks': len(downloaded_files)})}\n\n"
+            msg_queue.put({
+                "type": "complete",
+                "file_id": file_id,
+                "filename": zip_filename,
+                "total_tracks": len(track_files),
+                "size_formatted": format_size(zip_size),
+            })
 
-        except Exception as err:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            yield f"data: {json.dumps({'type': 'error', 'message': str(err)})}\n\n"
+        except Exception as e:
+            msg_queue.put({"type": "error", "message": str(e)})
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    t = threading.Thread(target=run_playlist_task, daemon=True)
+    t.start()
+
+    async def event_generator():
+        while True:
+            try:
+                msg = msg_queue.get(timeout=60.0)
+                yield f"data: {json.dumps(msg)}\n\n"
+                if msg.get("type") in ("complete", "error"):
+                    break
+            except queue.Empty:
+                yield ": keepalive\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
 
 
+# ── Endpoint: Download Ready Playlist ZIP File ────────────────────────────────
 @app.get("/api/get-zip-file")
-def get_zip_file(file_id: str = Query(...)):
-    """Serve the generated ZIP file and clean up temp folder after transfer."""
-    item = ZIP_STORAGE.pop(file_id, None)
-    if not item or not os.path.exists(item['path']):
-        raise HTTPException(status_code=404, detail="ZIP archive expired or not found.")
+async def get_zip_file(file_id: str = Query(...)):
+    info = ZIP_STORAGE.get(file_id)
+    if not info or not os.path.exists(info["filepath"]):
+        raise HTTPException(status_code=404, detail="ZIP archive was not found or has expired.")
 
-    zip_path = item['path']
-    tmp_dir = item['tmp_dir']
-    filename = item['filename']
-    filesize = item['size']
+    safe_filename = urllib.parse.quote(info["filename"])
+    return FileResponse(
+        path=info["filepath"],
+        filename=info["filename"],
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{safe_filename}"
+        }
+    )
 
-    def iterzip():
-        try:
-            with open(zip_path, mode="rb") as f:
-                while chunk := f.read(1024 * 256):
+
+# ── Endpoint: Direct Stream Proxy Pipe ─────────────────────────────────────────
+@app.get("/api/proxy-pipe")
+async def proxy_pipe(
+    stream_url: str = Query(...),
+    title: str = Query("media"),
+    ext: str = Query("mp4")
+):
+    """Pipe direct CDN stream chunks directly to browser download."""
+    import httpx
+
+    safe_name = sanitize_filename(title)
+    filename = f"{safe_name}.{ext}"
+    safe_header_fn = urllib.parse.quote(filename)
+
+    async def stream_cdn():
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+            async with client.stream("GET", stream_url) as resp:
+                async for chunk in resp.aiter_bytes(chunk_size=65536):
                     yield chunk
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    safe_zip_ascii = sanitize_filename(filename.replace('.zip', '')) + ".zip"
-    utf8_zip_encoded = urllib.parse.quote(filename)
-
-    headers = {
-        "Content-Disposition": f'attachment; filename="{safe_zip_ascii}"; filename*=UTF-8\'\'{utf8_zip_encoded}',
-        "Content-Length": str(filesize),
-        "Access-Control-Expose-Headers": "Content-Disposition, Content-Length",
-    }
-    return StreamingResponse(iterzip(), headers=headers, media_type="application/zip")
+    media_type = "video/mp4" if ext == "mp4" else "audio/mpeg"
+    return StreamingResponse(
+        stream_cdn(),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{safe_header_fn}",
+        }
+    )
