@@ -122,26 +122,43 @@ def get_base_ydl_opts() -> dict:
         'retries': 3,
         'extractor_args': {
             'youtube': {
-                'player_client': ['ios', 'android', 'mweb', 'web_creator', 'tv_embedded'],
+                'player_client': ['android', 'ios', 'mweb', 'web_creator', 'tv_embedded'],
                 'player_skip': ['webpage', 'configs'],
             }
         },
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
         }
     }
 
-    # Support optional cookies from environment variable for Vercel/cloud
-    cookies_env = os.environ.get('YOUTUBE_COOKIES') or os.environ.get('YT_COOKIES')
+    # 1. Check local cookies.txt file if present
+    for local_cookie in ['cookies.txt', 'youtube_cookies.txt', '/tmp/cookies.txt']:
+        if os.path.exists(local_cookie):
+            opts['cookiefile'] = local_cookie
+            return opts
+
+    # 2. Check environment variables (YOUTUBE_COOKIES, YT_COOKIES, COOKIES)
+    cookies_env = os.environ.get('YOUTUBE_COOKIES') or os.environ.get('YT_COOKIES') or os.environ.get('COOKIES')
     if cookies_env:
         try:
+            import base64
+            raw_text = cookies_env.strip()
+            # If base64-encoded, decode it
+            if not raw_text.startswith('# Netscape') and not '\t' in raw_text:
+                try:
+                    decoded = base64.b64decode(raw_text).decode('utf-8')
+                    if '# Netscape' in decoded or '\t' in decoded:
+                        raw_text = decoded
+                except Exception:
+                    pass
+
             cookie_file = tempfile.NamedTemporaryFile(delete=False, suffix='.txt', mode='w', encoding='utf-8')
-            cookie_file.write(cookies_env)
+            cookie_file.write(raw_text)
             cookie_file.close()
             opts['cookiefile'] = cookie_file.name
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Notice: Could not parse YOUTUBE_COOKIES: {e}")
 
     return opts
 
@@ -288,10 +305,11 @@ def get_video_info(req: VideoInfoRequest):
                     "video_streams": video_streams,
                     "audio_streams": audio_streams,
                 }
-        except HTTPException:
-            raise
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to fetch details: {str(e)}")
+            err_msg = str(e)
+            if "Sign in to confirm you" in err_msg or "not a bot" in err_msg or "bot" in err_msg.lower():
+                err_msg = "YouTube Bot Verification: Cloud servers (Vercel) require cookies to bypass verification. Please export your YouTube cookies using the 'Get cookies.txt LOCALLY' extension and paste them into Vercel Project Settings -> Environment Variables as YOUTUBE_COOKIES."
+            raise HTTPException(status_code=400, detail=f"Failed to fetch details: {err_msg}")
 
     raise HTTPException(status_code=500, detail="Download engine not available.")
 
