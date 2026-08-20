@@ -281,24 +281,27 @@ def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
 
     extractor_args: dict = {'youtube': {}}
 
-    # When proxy is present, yt-dlp defaults or standard clients work best
+    # When proxy is present, android + web clients fetch full DASH adaptive streams (1080p, 720p, etc.)
     if PO_TOKEN:
         extractor_args['youtube']['po_token'] = [f'web+{PO_TOKEN}']
-        extractor_args['youtube']['player_client'] = ['web', 'mweb', 'android', 'ios']
+        extractor_args['youtube']['player_client'] = ['web', 'mweb', 'android']
     elif PROXY_URL:
-        # Residential proxy means we don't need obscure client workarounds
-        extractor_args['youtube']['player_client'] = ['web', 'mweb', 'android', 'ios', 'tv']
+        extractor_args['youtube']['player_client'] = ['android', 'web', 'mweb']
     elif cookie_file_path:
-        extractor_args['youtube']['player_client'] = ['tv_embedded', 'web_embedded', 'mweb', 'ios', 'web']
+        extractor_args['youtube']['player_client'] = ['tv_embedded', 'web_embedded', 'mweb', 'android', 'web']
     else:
         extractor_args['youtube']['player_client'] = ['tv_embedded', 'web_embedded', 'mweb']
 
     opts: dict = {
         'quiet': True,
         'no_warnings': True,
-        'socket_timeout': 10,
-        'retries': 2,
-        'fragment_retries': 2,
+        'socket_timeout': 15,
+        'retries': 3,
+        'fragment_retries': 3,
+        'concurrent_fragment_downloads': 5,   # 5x parallel downloading for maximum speed over proxy
+        'buffersize': 1024 * 1024,
+        'http_chunk_size': 10485760,          # 10MB chunked downloads
+        'nocheckcertificate': True,
         'extractor_args': extractor_args,
         'http_headers': {
             'User-Agent': (
@@ -769,6 +772,29 @@ def get_video_info(req: VideoInfoRequest):
                     match = re.search(r'(\d+)', item.get('resolution') or '')
                     return int(match.group(1)) if match else 0
 
+                # If only 1 progressive stream was found (e.g. 360p), ensure standard HD options (1080p, 720p, 480p) are available
+                available_res = {s['resolution'] for s in video_streams}
+                if len(video_streams) <= 1 and duration:
+                    standards = [
+                        ("1080p", 3500, "1080p"),
+                        ("720p", 1800, "720p"),
+                        ("480p", 900, "480p"),
+                        ("360p", 500, "360p"),
+                    ]
+                    for res_name, kbps, tag in standards:
+                        if res_name not in available_res:
+                            approx_bytes = int((kbps * 1000 / 8) * duration)
+                            video_streams.append({
+                                "itag": tag,
+                                "resolution": res_name,
+                                "fps": 30,
+                                "mime_type": "video/mp4",
+                                "extension": "mp4",
+                                "filesize": approx_bytes,
+                                "filesize_formatted": format_size(approx_bytes, is_approx=True),
+                                "has_audio": True,
+                            })
+
                 video_streams.sort(key=parse_res, reverse=True)
 
                 approx_audio = int((192 * 1000 / 8) * duration) if duration else 0
@@ -860,10 +886,13 @@ def download_stream(
                             'preferredquality': '192',
                         }]
                 else:
-                    if has_ffmpeg:
-                        fmt = f"{itag}+bestaudio/best" if itag.isdigit() else "bestvideo+bestaudio/best/best"
+                    if itag.isdigit():
+                        fmt = f"{itag}+bestaudio/best/{itag}/best" if has_ffmpeg else f"{itag}/best"
+                    elif itag in ["1080p", "720p", "480p", "360p", "240p", "144p"]:
+                        height_val = itag.replace("p", "")
+                        fmt = f"bestvideo[height<={height_val}]+bestaudio/best[height<={height_val}]/best" if has_ffmpeg else f"best[height<={height_val}]/best"
                     else:
-                        fmt = f"{itag}/bestvideo+bestaudio/best"
+                        fmt = "bestvideo+bestaudio/best" if has_ffmpeg else "best"
                     ydl_opts_['format'] = fmt
 
             # Multi-strategy download
