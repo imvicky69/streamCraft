@@ -146,8 +146,14 @@ def format_duration(seconds: Optional[int]) -> str:
 
 
 def clean_url(url: str) -> str:
-    """Normalize URL, transform music.youtube.com & shorts, fix missing https://."""
+    """Normalize URL, transform music.youtube.com & shorts, fix missing https:// or support search keywords."""
     url = url.strip()
+
+    # If user typed search keywords (e.g. "Tum ho" or "Song Name") without a URL structure
+    if not (url.startswith('http://') or url.startswith('https://') or 'youtube.com' in url or 'youtu.be' in url):
+        if '.' not in url or '/' not in url:
+            return f"ytsearch1:{url}"
+
     url = re.sub(r'\s+', '', url)
 
     if not url.startswith('http://') and not url.startswith('https://'):
@@ -173,7 +179,6 @@ def clean_url(url: str) -> str:
 
     # Clean trailing ampersands
     url = url.rstrip('&?')
-
     return url
 
 
@@ -367,6 +372,16 @@ def _ytdlp_extract_info(url: str) -> Optional[dict]:
     }
     s3.update(base_extract_opts)
     strategies.append(("tv-embedded-no-cookie", s3))
+
+    # Strategy 4: Direct connection without proxy (in case proxy is down or throws 502 Bad Gateway)
+    if PROXY_URL:
+        s4 = get_base_ydl_opts()
+        s4.pop('proxy', None)
+        s4['extractor_args'] = {
+            'youtube': {'player_client': ['tv_embedded', 'web_embedded', 'mweb']}
+        }
+        s4.update(base_extract_opts)
+        strategies.append(("direct-no-proxy-fallback", s4))
 
     for strategy_name, opts in strategies:
         try:
@@ -995,6 +1010,14 @@ async def download_single_sse(
                         s2['proxy'] = PROXY_URL
                     _build_fmt(s2)
                     strategies_dl.append(("no-cookie-fallback", s2))
+
+                if PROXY_URL:
+                    s3 = get_base_ydl_opts()
+                    s3.pop('proxy', None)
+                    s3['outtmpl'] = out_template
+                    s3['progress_hooks'] = [progress_hook]
+                    _build_fmt(s3)
+                    strategies_dl.append(("direct-no-proxy-fallback", s3))
 
                 info_res = None
                 dl_file = None
