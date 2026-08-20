@@ -9,6 +9,13 @@ import PlaylistView from './components/PlaylistView';
 import Features from './components/Features';
 import Scanner from './components/Scanner';
 
+const BACKEND_BASE =
+  import.meta.env.VITE_API_URL ||
+  (typeof window !== 'undefined' &&
+  (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+    ? ''
+    : 'https://streamcraft-backend.onrender.com');
+
 export default function App() {
   const [theme, setTheme] = useState(() => {
     return localStorage.getItem('theme') || 'dark';
@@ -83,7 +90,7 @@ export default function App() {
     const timeoutId = setTimeout(() => controller.abort(), 60000);
 
     try {
-      const res = await fetch('/api/info', {
+      const res = await fetch(`${BACKEND_BASE}/api/info`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: cleanInput }),
@@ -94,7 +101,7 @@ export default function App() {
 
       if (!res.ok) {
         if (res.status === 502 || res.status === 504) {
-          throw new Error('Backend server is not running on port 8000. Start it with "npm start" or "npm run backend".');
+          throw new Error('Backend server is not running or starting up on Render. Please wait 30s and try again.');
         }
         let errorMsg = 'Failed to fetch details.';
         try {
@@ -145,7 +152,7 @@ export default function App() {
       setDownloadController(null);
     }
     if (currentDownloadId) {
-      fetch(`/api/cancel-download?download_id=${currentDownloadId}`, { method: 'POST' }).catch(() => {});
+      fetch(`${BACKEND_BASE}/api/cancel-download?download_id=${currentDownloadId}`, { method: 'POST' }).catch(() => {});
       setCurrentDownloadId(null);
     }
     setDownloading(false);
@@ -158,8 +165,6 @@ export default function App() {
     const isAudio = !selectedStream.resolution;
 
     // 🚀 ULTRA-FAST DIRECT STREAM PATH:
-    // If direct Google CDN stream URL is available and video MP4 is selected,
-    // trigger instant direct stream download with 0.1s wait time!
     if (!isAudio && selectedStream.direct_url) {
       setDownloading(true);
       setDownloadSuccess(false);
@@ -173,7 +178,7 @@ export default function App() {
       });
 
       const cleanTitle = (videoInfo.title || 'video').replace(/[\\/*?:"<>|]/g, '');
-      const pipeUrl = `/api/proxy-pipe?stream_url=${encodeURIComponent(selectedStream.direct_url)}&title=${encodeURIComponent(cleanTitle)}&ext=${selectedStream.extension || 'mp4'}`;
+      const pipeUrl = `${BACKEND_BASE}/api/proxy-pipe?stream_url=${encodeURIComponent(selectedStream.direct_url)}&title=${encodeURIComponent(cleanTitle)}&ext=${selectedStream.extension || 'mp4'}`;
 
       const a = document.createElement('a');
       a.href = pipeUrl;
@@ -207,12 +212,11 @@ export default function App() {
     setError('');
 
     try {
-      const downloadSseUrl = `/api/download-single-sse?url=${encodeURIComponent(url.trim())}&itag=${selectedStream.itag}&audio_only=${isAudio}&download_id=${downloadId}`;
+      const downloadSseUrl = `${BACKEND_BASE}/api/download-single-sse?url=${encodeURIComponent(url.trim())}&itag=${selectedStream.itag}&audio_only=${isAudio}&download_id=${downloadId}`;
 
       const response = await fetch(downloadSseUrl, { signal: controller.signal });
       if (!response.ok) {
         if (response.status === 502 || response.status === 504) {
-          // Vercel / Edge proxy timeout -> Fallback directly to browser one-click stream download!
           console.warn('Vercel 502 proxy detected on SSE. Switching to direct download mode...');
           setDownloadProgress(prev => ({
             ...prev,
@@ -220,7 +224,7 @@ export default function App() {
             status: '⚡ Downloading directly from server...',
           }));
 
-          const directUrl = `/api/download-direct?url=${encodeURIComponent(url.trim())}&itag=${selectedStream.itag}&audio_only=${isAudio}`;
+          const directUrl = `${BACKEND_BASE}/api/download-direct?url=${encodeURIComponent(url.trim())}&itag=${selectedStream.itag}&audio_only=${isAudio}`;
           const cleanTitle = (videoInfo.title || 'media').replace(/[\\/*?:"<>|]/g, '');
           const a = document.createElement('a');
           a.href = directUrl;
@@ -291,8 +295,8 @@ export default function App() {
                 status: '🎉 Download complete! Starting browser download...',
               });
 
-              // Trigger native browser download directly
-              const fileUrl = `/api/get-single-file?file_id=${data.file_id}`;
+              // Trigger native browser download directly from Render backend
+              const fileUrl = `${BACKEND_BASE}/api/get-single-file?file_id=${data.file_id}`;
               const a = document.createElement('a');
               a.href = fileUrl;
               a.download = data.filename || 'media';
@@ -333,7 +337,7 @@ export default function App() {
     setZipProgress({ percent: 0, current: 0, total: 0, title: '', eta: 'Starting download...', status: 'Connecting...' });
     setError('');
 
-    const sseUrl = `/api/playlist-zip-sse?url=${encodeURIComponent(url.trim())}&audio_only=${audioOnly}&max_tracks=${maxTracks}`;
+    const sseUrl = `${BACKEND_BASE}/api/playlist-zip-sse?url=${encodeURIComponent(url.trim())}&audio_only=${audioOnly}&max_tracks=${maxTracks}`;
     const eventSource = new EventSource(sseUrl);
 
     eventSource.onmessage = (event) => {
@@ -369,9 +373,9 @@ export default function App() {
           setDownloadingZip(false);
           setZipSuccess(data);
 
-          // Auto-trigger browser download of the ready ZIP file
+          // Auto-trigger browser download of the ready ZIP file directly from Render backend
           const a = document.createElement('a');
-          a.href = `/api/get-zip-file?file_id=${data.file_id}`;
+          a.href = `${BACKEND_BASE}/api/get-zip-file?file_id=${data.file_id}`;
           a.download = data.filename || 'playlist.zip';
           document.body.appendChild(a);
           a.click();

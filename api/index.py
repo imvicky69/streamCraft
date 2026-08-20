@@ -696,14 +696,10 @@ async def get_single_file(file_id: str = Query(...)):
     if not info or not os.path.exists(info["filepath"]):
         raise HTTPException(status_code=404, detail="Requested file was not found or has expired.")
 
-    safe_filename = urllib.parse.quote(info["filename"])
     return FileResponse(
         path=info["filepath"],
         filename=info["filename"],
         media_type=info.get("mimetype", "application/octet-stream"),
-        headers={
-            "Content-Disposition": f"attachment; filename*=UTF-8''{safe_filename}"
-        }
     )
 
 
@@ -758,15 +754,11 @@ async def download_direct(
         ext = os.path.splitext(final_filepath)[1].lstrip(".").lower() or ("mp3" if audio_only else "mp4")
         safe_title = sanitize_filename(title)
         final_filename = f"{safe_title}.{ext}"
-        safe_header_name = urllib.parse.quote(final_filename)
 
         return FileResponse(
             path=final_filepath,
             filename=final_filename,
             media_type="audio/mpeg" if ext == "mp3" else "video/mp4",
-            headers={
-                "Content-Disposition": f"attachment; filename*=UTF-8''{safe_header_name}"
-            }
         )
     except Exception as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -947,14 +939,10 @@ async def get_zip_file(file_id: str = Query(...)):
     if not info or not os.path.exists(info["filepath"]):
         raise HTTPException(status_code=404, detail="ZIP archive was not found or has expired.")
 
-    safe_filename = urllib.parse.quote(info["filename"])
     return FileResponse(
         path=info["filepath"],
         filename=info["filename"],
         media_type="application/zip",
-        headers={
-            "Content-Disposition": f"attachment; filename*=UTF-8''{safe_filename}"
-        }
     )
 
 
