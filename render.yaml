@@ -1,0 +1,27 @@
+# render.yaml — StreamCraft Render Deployment Blueprint
+# Deploy this by connecting your GitHub repo on render.com → New → Blueprint
+
+services:
+  - type: web
+    name: streamcraft-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore   # Closest to India — lowest latency
+    branch: main
+
+    # Health check endpoint
+    healthCheckPath: /api/health
+
+    # Environment variables — set YOUTUBE_COOKIES in Render dashboard
+    # Render → streamcraft-backend → Environment → Add Environment Variable
+    envVars:
+      - key: YOUTUBE_COOKIES
+        sync: false   # Secret — must be set manually in Render dashboard
+
+      # Optional: add more cookie accounts for rotation
+      # - key: YOUTUBE_COOKIES_2
+      #   sync: false
+
+    # Auto-deploy on every push to main
+    autoDeploy: true

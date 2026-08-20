@@ -34,11 +34,13 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Allow all origins in development; on production Render serves both frontend proxied via Vercel
+# and direct browser requests, so we keep '*' for maximum compatibility.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -119,24 +121,23 @@ COOKIE_FILES: List[str] = []
 
 
 def clean_netscape_cookies(raw_text: str) -> str:
-    """Filter out volatile/conflicting cookies and preserve stable auth tokens."""
-    allowed_cookies = {
-        'SID', 'HSID', 'SSID', 'APISID', 'SAPISID',
-        'LOGIN_INFO', '__Secure-1PSID', '__Secure-3PSID',
-        '__Secure-1PAPISID', '__Secure-3PAPISID', 'PREF'
-    }
+    """Preserve ALL YouTube cookies — do NOT strip anti-bot cookies.
+    YouTube uses VISITOR_INFO1_LIVE, YSC, CONSISTENCY etc for bot checks.
+    Removing them is what causes the 'Sign in to confirm' error on cloud IPs.
+    """
     lines = raw_text.splitlines()
     clean_lines = ['# Netscape HTTP Cookie File']
     for l in lines:
+        if not l.strip():
+            continue
+        # Keep comment header lines
         if l.startswith('#'):
+            if 'Netscape' in l or 'yt-dlp' in l or 'Do not edit' in l:
+                continue  # skip duplicate headers
             continue
         parts = l.strip().split('\t')
         if len(parts) >= 7:
-            name = parts[5]
-            if name in allowed_cookies:
-                clean_lines.append(l)
-            elif not any(bad in name for bad in ['CONSISTENCY', 'ROLLOUT', 'YNID', 'YSC', 'PSIDTS', 'VISITOR']):
-                clean_lines.append(l)
+            clean_lines.append(l)
     return '\n'.join(clean_lines) + '\n'
 
 
@@ -215,20 +216,30 @@ def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
         else:
             cookie_file_path = random.choice(COOKIE_FILES)
 
+    # On cloud/datacenter IPs (Render, Vercel etc), 'android' and 'ios' clients
+    # are heavily flagged. 'web' with valid cookies is most reliable.
+    # 'tv_embedded' and 'web_creator' bypass age-gates and bot checks better.
+    if cookie_file_path:
+        player_clients = ['web', 'tv_embedded', 'web_creator', 'mweb']
+    else:
+        # No cookies — use clients that don't require auth
+        player_clients = ['mweb', 'web', 'tv_embedded']
+
     opts = {
         'quiet': True,
         'no_warnings': True,
-        'socket_timeout': 15,
-        'retries': 3,
+        'socket_timeout': 30,
+        'retries': 5,
+        'fragment_retries': 5,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'ios', 'mweb', 'web'] if cookie_file_path else ['android', 'ios', 'mweb'],
-                'player_skip': [] if cookie_file_path else ['webpage', 'configs', 'js'],
+                'player_client': player_clients,
             }
         },
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         }
     }
 
@@ -382,8 +393,19 @@ def get_video_info(req: VideoInfoRequest):
                 }
         except Exception as e:
             err_msg = str(e)
-            if "Sign in to confirm you" in err_msg or "not a bot" in err_msg or "bot" in err_msg.lower():
-                err_msg = "YouTube Bot Verification: Cloud servers (Vercel) require cookies to bypass verification. Please export your YouTube cookies using the 'Get cookies.txt LOCALLY' extension and paste them into Vercel Project Settings -> Environment Variables as YOUTUBE_COOKIES."
+            if "Sign in to confirm" in err_msg or "not a bot" in err_msg or "bot" in err_msg.lower():
+                cookie_loaded = bool(COOKIE_FILES)
+                if cookie_loaded:
+                    err_msg = ("YouTube Bot Verification failed even with cookies. "
+                               "Your cookies may be expired. Please re-export fresh cookies using "
+                               "the 'Get cookies.txt LOCALLY' Chrome extension and update YOUTUBE_COOKIES "
+                               "in Render → Environment Variables.")
+                else:
+                    err_msg = ("YouTube Bot Verification: No cookies found. "
+                               "Please add YOUTUBE_COOKIES in Render → Environment Variables. "
+                               "Export cookies with 'Get cookies.txt LOCALLY' Chrome extension.")
+            elif "Video unavailable" in err_msg:
+                err_msg = "This video is unavailable or private."
             raise HTTPException(status_code=400, detail=f"Failed to fetch details: {err_msg}")
 
     raise HTTPException(status_code=500, detail="Download engine not available.")
