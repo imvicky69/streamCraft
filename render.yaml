@@ -23,10 +23,15 @@ services:
       # - key: YOUTUBE_COOKIES_2
       #   sync: false
 
-      # RECOMMENDED: Set a residential proxy to bypass Render's blocked datacenter IP.
-      # Free tier: https://webshare.io (10 free residential proxies)
-      # Format: http://user:pass@host:port  OR  socks5://user:pass@host:port
-      # - key: PROXY_URL
+      # RECOMMENDED: Set residential proxy or rotating proxy gateway
+      # Format: http://user:pass@host:port OR socks5://user:pass@host:port
+      # Supports single proxy, rotating gateway, comma-separated list, or PROXY_URL_1, PROXY_URL_2
+      - key: PROXY_URL
+        sync: false
+
+      # - key: PROXY_URL_1
+      #   sync: false
+      # - key: PROXY_URL_2
       #   sync: false
 
       # RECOMMENDED: PO Token (Proof of Origin) — bypasses bot detection on cloud IPs.

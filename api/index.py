@@ -47,14 +47,39 @@ ZIP_STORAGE: Dict[str, Dict[str, Any]] = {}
 ACTIVE_DOWNLOADS: Dict[str, threading.Event] = {}
 
 # ── Configuration & Environment Helpers ───────────────────────────────────────
-PROXY_URL: Optional[str] = (
-    os.environ.get("PROXY_URL") or
-    os.environ.get("HTTPS_PROXY") or
-    os.environ.get("HTTP_PROXY") or
-    None
-)
-
 PO_TOKEN: Optional[str] = os.environ.get("PO_TOKEN") or None
+
+
+def get_proxy_pool() -> List[str]:
+    """Discover all proxies from PROXY_URL, PROXY_LIST, PROXY_URL_1..N, HTTPS_PROXY, HTTP_PROXY."""
+    proxies = []
+    
+    # 1. Comma, semicolon, or newline separated lists in PROXY_URL or PROXY_LIST
+    for key in ["PROXY_URL", "PROXY_LIST", "PROXIES", "HTTPS_PROXY", "HTTP_PROXY"]:
+        val = os.environ.get(key)
+        if val and val.strip():
+            for item in re.split(r"[,;\n]+", val):
+                p = item.strip()
+                if p and p not in proxies:
+                    proxies.append(p)
+
+    # 2. Numbered environment variables: PROXY_URL_1, PROXY_URL_2, etc.
+    for k, v in os.environ.items():
+        if k.startswith("PROXY_URL_") and v.strip():
+            p = v.strip()
+            if p not in proxies:
+                proxies.append(p)
+
+    return proxies
+
+
+def get_active_proxy() -> Optional[str]:
+    """Pick a random proxy from the available pool for automatic load balancing/rotation."""
+    pool = get_proxy_pool()
+    if pool:
+        import random
+        return random.choice(pool)
+    return None
 
 
 def get_cookie_file_path() -> Optional[str]:
@@ -92,6 +117,8 @@ def get_cookie_file_path() -> Optional[str]:
 def get_base_ydl_opts(extra_opts: Optional[dict] = None) -> dict:
     """Build standard yt-dlp options dictionary with cookies, proxy, and robust extractor options."""
     cookie_file = get_cookie_file_path()
+    active_proxy = get_active_proxy()
+
     opts: dict = {
         "quiet": True,
         "no_warnings": True,
@@ -109,8 +136,8 @@ def get_base_ydl_opts(extra_opts: Optional[dict] = None) -> dict:
     if cookie_file and os.path.exists(cookie_file):
         opts["cookiefile"] = cookie_file
 
-    if PROXY_URL:
-        opts["proxy"] = PROXY_URL
+    if active_proxy:
+        opts["proxy"] = active_proxy
 
     if extra_opts:
         opts.update(extra_opts)
@@ -236,12 +263,14 @@ def cleanup_old_files():
 @app.get("/api/health")
 async def health_check():
     cookie_file = get_cookie_file_path()
+    proxy_pool = get_proxy_pool()
     return {
         "status": "ok",
         "service": "StreamCraft Backend",
         "yt_dlp_version": getattr(yt_dlp.version, "__version__", "unknown"),
         "cookies_configured": bool(cookie_file),
-        "proxy_configured": bool(PROXY_URL),
+        "proxy_configured": len(proxy_pool) > 0,
+        "proxies_count": len(proxy_pool),
         "po_token_configured": bool(PO_TOKEN),
     }
 
