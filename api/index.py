@@ -114,7 +114,36 @@ def sanitize_filename(name: str) -> str:
 
 
 def get_base_ydl_opts() -> dict:
-    """Base yt-dlp options with iOS, Android, and mweb player clients to bypass cloud datacenter bot checks."""
+    """Base yt-dlp options configured to bypass cloud bot checks."""
+    # 1. Check local cookies.txt file if present
+    cookie_file_path = None
+    for local_cookie in ['cookies.txt', 'youtube_cookies.txt', '/tmp/cookies.txt']:
+        if os.path.exists(local_cookie):
+            cookie_file_path = local_cookie
+            break
+
+    # 2. Check environment variables (YOUTUBE_COOKIES, YT_COOKIES, COOKIES)
+    if not cookie_file_path:
+        cookies_env = os.environ.get('YOUTUBE_COOKIES') or os.environ.get('YT_COOKIES') or os.environ.get('COOKIES')
+        if cookies_env:
+            try:
+                import base64
+                raw_text = cookies_env.strip()
+                if not raw_text.startswith('# Netscape') and '\t' not in raw_text:
+                    try:
+                        decoded = base64.b64decode(raw_text).decode('utf-8')
+                        if '# Netscape' in decoded or '\t' in decoded:
+                            raw_text = decoded
+                    except Exception:
+                        pass
+
+                cookie_file = tempfile.NamedTemporaryFile(delete=False, suffix='.txt', mode='w', encoding='utf-8')
+                cookie_file.write(raw_text)
+                cookie_file.close()
+                cookie_file_path = cookie_file.name
+            except Exception as e:
+                print(f"Notice: Could not parse YOUTUBE_COOKIES: {e}")
+
     opts = {
         'quiet': True,
         'no_warnings': True,
@@ -122,8 +151,8 @@ def get_base_ydl_opts() -> dict:
         'retries': 3,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'ios', 'mweb', 'web_creator', 'tv_embedded'],
-                'player_skip': ['webpage', 'configs'],
+                'player_client': ['android', 'ios', 'mweb', 'web'] if cookie_file_path else ['android', 'ios', 'mweb'],
+                'player_skip': [] if cookie_file_path else ['webpage', 'configs', 'js'],
             }
         },
         'http_headers': {
@@ -132,33 +161,8 @@ def get_base_ydl_opts() -> dict:
         }
     }
 
-    # 1. Check local cookies.txt file if present
-    for local_cookie in ['cookies.txt', 'youtube_cookies.txt', '/tmp/cookies.txt']:
-        if os.path.exists(local_cookie):
-            opts['cookiefile'] = local_cookie
-            return opts
-
-    # 2. Check environment variables (YOUTUBE_COOKIES, YT_COOKIES, COOKIES)
-    cookies_env = os.environ.get('YOUTUBE_COOKIES') or os.environ.get('YT_COOKIES') or os.environ.get('COOKIES')
-    if cookies_env:
-        try:
-            import base64
-            raw_text = cookies_env.strip()
-            # If base64-encoded, decode it
-            if not raw_text.startswith('# Netscape') and not '\t' in raw_text:
-                try:
-                    decoded = base64.b64decode(raw_text).decode('utf-8')
-                    if '# Netscape' in decoded or '\t' in decoded:
-                        raw_text = decoded
-                except Exception:
-                    pass
-
-            cookie_file = tempfile.NamedTemporaryFile(delete=False, suffix='.txt', mode='w', encoding='utf-8')
-            cookie_file.write(raw_text)
-            cookie_file.close()
-            opts['cookiefile'] = cookie_file.name
-        except Exception as e:
-            print(f"Notice: Could not parse YOUTUBE_COOKIES: {e}")
+    if cookie_file_path:
+        opts['cookiefile'] = cookie_file_path
 
     return opts
 
