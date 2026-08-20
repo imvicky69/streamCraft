@@ -296,9 +296,9 @@ def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
     opts: dict = {
         'quiet': True,
         'no_warnings': True,
-        'socket_timeout': 30,
-        'retries': 6,
-        'fragment_retries': 6,
+        'socket_timeout': 10,
+        'retries': 2,
+        'fragment_retries': 2,
         'extractor_args': extractor_args,
         'http_headers': {
             'User-Agent': (
@@ -513,7 +513,7 @@ def innertube_get_info(video_id: str) -> Optional[dict]:
             }
 
             resp = httpx.post(
-                api_url, json=payload, timeout=15,
+                api_url, json=payload, timeout=8,
                 headers={
                     "Content-Type": "application/json",
                     "User-Agent": client_cfg["user_agent"],
