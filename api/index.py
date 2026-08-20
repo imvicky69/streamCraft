@@ -113,36 +113,65 @@ def sanitize_filename(name: str) -> str:
     return ascii_clean or "media"
 
 
-def get_base_ydl_opts() -> dict:
-    """Base yt-dlp options configured to bypass cloud bot checks."""
-    # 1. Check local cookies.txt file if present
+import random
+
+COOKIE_FILES: List[str] = []
+
+
+def init_cookie_pool():
+    """Discover and initialize multiple cookie accounts from env variables and files."""
+    global COOKIE_FILES
+    COOKIE_FILES = []
+
+    # 1. Local cookie files
+    for local_file in ['cookies.txt', 'youtube_cookies.txt', '/tmp/cookies.txt', 'cookies_1.txt', 'cookies_2.txt']:
+        if os.path.exists(local_file) and local_file not in COOKIE_FILES:
+            COOKIE_FILES.append(local_file)
+
+    # 2. Environment variables: YOUTUBE_COOKIES, YOUTUBE_COOKIES_1, YOUTUBE_COOKIES_2, etc.
+    cookie_entries = []
+    for k, v in os.environ.items():
+        if (k.startswith('YOUTUBE_COOKIE') or k.startswith('YT_COOKIE') or k == 'COOKIES') and v.strip():
+            if '===COOKIE===' in v:
+                cookie_entries.extend([part.strip() for part in v.split('===COOKIE===') if part.strip()])
+            else:
+                cookie_entries.append(v.strip())
+
+    for idx, raw_cookie in enumerate(cookie_entries):
+        try:
+            import base64
+            if not raw_cookie.startswith('# Netscape') and '\t' not in raw_cookie:
+                try:
+                    decoded = base64.b64decode(raw_cookie).decode('utf-8')
+                    if '# Netscape' in decoded or '\t' in decoded:
+                        raw_cookie = decoded
+                except Exception:
+                    pass
+
+            f = tempfile.NamedTemporaryFile(delete=False, suffix=f'_yt_cookie_{idx}.txt', mode='w', encoding='utf-8')
+            f.write(raw_cookie)
+            f.close()
+            COOKIE_FILES.append(f.name)
+        except Exception as e:
+            print(f"Notice: Failed to load cookie #{idx}: {e}")
+
+
+# Initialize pool at startup
+init_cookie_pool()
+
+
+def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
+    """Base yt-dlp options configured with cookie pool rotation."""
+    global COOKIE_FILES
+    if not COOKIE_FILES:
+        init_cookie_pool()
+
     cookie_file_path = None
-    for local_cookie in ['cookies.txt', 'youtube_cookies.txt', '/tmp/cookies.txt']:
-        if os.path.exists(local_cookie):
-            cookie_file_path = local_cookie
-            break
-
-    # 2. Check environment variables (YOUTUBE_COOKIES, YT_COOKIES, COOKIES)
-    if not cookie_file_path:
-        cookies_env = os.environ.get('YOUTUBE_COOKIES') or os.environ.get('YT_COOKIES') or os.environ.get('COOKIES')
-        if cookies_env:
-            try:
-                import base64
-                raw_text = cookies_env.strip()
-                if not raw_text.startswith('# Netscape') and '\t' not in raw_text:
-                    try:
-                        decoded = base64.b64decode(raw_text).decode('utf-8')
-                        if '# Netscape' in decoded or '\t' in decoded:
-                            raw_text = decoded
-                    except Exception:
-                        pass
-
-                cookie_file = tempfile.NamedTemporaryFile(delete=False, suffix='.txt', mode='w', encoding='utf-8')
-                cookie_file.write(raw_text)
-                cookie_file.close()
-                cookie_file_path = cookie_file.name
-            except Exception as e:
-                print(f"Notice: Could not parse YOUTUBE_COOKIES: {e}")
+    if COOKIE_FILES:
+        if cookie_idx is not None and 0 <= cookie_idx < len(COOKIE_FILES):
+            cookie_file_path = COOKIE_FILES[cookie_idx]
+        else:
+            cookie_file_path = random.choice(COOKIE_FILES)
 
     opts = {
         'quiet': True,
