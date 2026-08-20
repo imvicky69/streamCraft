@@ -21,12 +21,31 @@ try:
 except Exception:
     pass
 
-# Try yt-dlp first
+# Try yt-dlp
 try:
     import yt_dlp
     HAS_YTDLP = True
 except ImportError:
     HAS_YTDLP = False
+
+# httpx for Invidious API calls (cookie-free fallback)
+try:
+    import httpx
+    HAS_HTTPX = True
+except ImportError:
+    HAS_HTTPX = False
+
+# ── Invidious public instances (cookie-free YouTube API) ──────────────────────
+# Tried in order; first one that responds wins.
+INVIDIOUS_INSTANCES = [
+    "https://inv.nadeko.net",
+    "https://invidious.fdn.fr",
+    "https://yt.cdaut.de",
+    "https://iv.melmac.space",
+    "https://invidious.nerdvpn.de",
+    "https://invidious.privacydev.net",
+    "https://invidious.io",
+]
 
 app = FastAPI(
     title="YouTube & YouTube Music Downloader API",
@@ -254,7 +273,121 @@ def health():
     return {
         "status": "ok",
         "engine": "yt-dlp" if HAS_YTDLP else "none",
+        "fallback_engine": "invidious" if HAS_HTTPX else "none",
+        "cookies_loaded": len(COOKIE_FILES),
         "message": "Downloader API is operational"
+    }
+
+
+# ── Invidious cookie-free helpers ─────────────────────────────────────────────
+
+def extract_video_id(url: str) -> Optional[str]:
+    """Extract YouTube video ID from any URL format."""
+    patterns = [
+        r'(?:v=|youtu\.be/|/embed/|/v/|/watch\?v=)([A-Za-z0-9_-]{11})',
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def invidious_get_info(video_id: str) -> Optional[dict]:
+    """Fetch video info from Invidious API — no cookies needed."""
+    if not HAS_HTTPX:
+        return None
+    fields = "title,author,lengthSeconds,viewCount,videoThumbnails,adaptiveFormats,formatStreams,description"
+    for instance in INVIDIOUS_INSTANCES:
+        try:
+            url = f"{instance}/api/v1/videos/{video_id}?fields={fields}"
+            resp = httpx.get(url, timeout=12, follow_redirects=True)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("title"):
+                    return data
+        except Exception as e:
+            print(f"Invidious instance {instance} failed: {e}")
+            continue
+    return None
+
+
+def invidious_info_to_response(data: dict, url: str) -> dict:
+    """Convert Invidious API response to our standard API response format."""
+    title = data.get("title", "Unknown Title")
+    author = data.get("author", "Unknown")
+    duration = data.get("lengthSeconds", 0)
+    views = data.get("viewCount", 0)
+
+    # Best thumbnail
+    thumbnails = data.get("videoThumbnails", [])
+    thumbnail = next((t["url"] for t in thumbnails if t.get("quality") in ["maxres", "high", "medium"]), "")
+    # Make thumbnail URL absolute if relative
+    if thumbnail and thumbnail.startswith("/"):
+        thumbnail = f"https://i.ytimg.com{thumbnail}"
+
+    # Video streams from adaptiveFormats
+    seen_res = set()
+    video_streams = []
+    for f in data.get("adaptiveFormats", []):
+        height = f.get("resolution", "").replace("p", "")
+        if not height:
+            continue
+        try:
+            height = int(height)
+        except Exception:
+            continue
+        vcodec = f.get("encoding", "")
+        mime = f.get("type", "")
+        if "video" not in mime:
+            continue
+        res_str = f"{height}p"
+        if res_str not in seen_res:
+            seen_res.add(res_str)
+            filesize = f.get("clen") or 0
+            try:
+                filesize = int(filesize)
+            except Exception:
+                filesize = 0
+            video_streams.append({
+                "itag": f.get("itag", res_str),
+                "resolution": res_str,
+                "fps": f.get("fps", 30),
+                "mime_type": "video/mp4",
+                "extension": "mp4",
+                "filesize": filesize,
+                "filesize_formatted": format_size(filesize) if filesize else "HD Stream",
+                "has_audio": True,
+                "_invidious_url": f.get("url", ""),  # direct stream URL
+            })
+
+    # Sort by resolution
+    video_streams.sort(key=lambda x: int(re.search(r'(\d+)', x['resolution']).group(1)) if re.search(r'(\d+)', x['resolution']) else 0, reverse=True)
+
+    # Audio streams
+    approx_320 = int((320 * 1000 / 8) * duration) if duration else 0
+    approx_192 = int((192 * 1000 / 8) * duration) if duration else 0
+    approx_128 = int((128 * 1000 / 8) * duration) if duration else 0
+    audio_streams = [
+        {"itag": "bestaudio", "abr": "320kbps", "mime_type": "audio/mp3", "extension": "mp3",
+         "filesize": approx_320, "filesize_formatted": format_size(approx_320, is_approx=True) if duration else "320 kbps MP3"},
+        {"itag": "bestaudio_192", "abr": "192kbps", "mime_type": "audio/mp3", "extension": "mp3",
+         "filesize": approx_192, "filesize_formatted": format_size(approx_192, is_approx=True) if duration else "192 kbps MP3"},
+        {"itag": "bestaudio_128", "abr": "128kbps", "mime_type": "audio/mp3", "extension": "mp3",
+         "filesize": approx_128, "filesize_formatted": format_size(approx_128, is_approx=True) if duration else "128 kbps MP3"},
+    ]
+
+    return {
+        "is_playlist": False,
+        "title": title,
+        "author": author,
+        "length_seconds": duration,
+        "length_formatted": format_duration(duration),
+        "views": views,
+        "thumbnail_url": thumbnail,
+        "video_streams": video_streams,
+        "audio_streams": audio_streams,
+        "_source": "invidious",  # debug: shows which engine served this
     }
 
 
@@ -393,22 +526,38 @@ def get_video_info(req: VideoInfoRequest):
                 }
         except Exception as e:
             err_msg = str(e)
-            if "Sign in to confirm" in err_msg or "not a bot" in err_msg or "bot" in err_msg.lower():
-                cookie_loaded = bool(COOKIE_FILES)
-                if cookie_loaded:
-                    err_msg = ("YouTube Bot Verification failed even with cookies. "
-                               "Your cookies may be expired. Please re-export fresh cookies using "
-                               "the 'Get cookies.txt LOCALLY' Chrome extension and update YOUTUBE_COOKIES "
-                               "in Render → Environment Variables.")
-                else:
-                    err_msg = ("YouTube Bot Verification: No cookies found. "
-                               "Please add YOUTUBE_COOKIES in Render → Environment Variables. "
-                               "Export cookies with 'Get cookies.txt LOCALLY' Chrome extension.")
-            elif "Video unavailable" in err_msg:
-                err_msg = "This video is unavailable or private."
-            raise HTTPException(status_code=400, detail=f"Failed to fetch details: {err_msg}")
+            is_bot_error = (
+                "Sign in to confirm" in err_msg or
+                "not a bot" in err_msg or
+                "bot" in err_msg.lower() or
+                "cookies" in err_msg.lower()
+            )
+            if not is_bot_error:
+                # Real error (not bot detection) — raise immediately
+                if "Video unavailable" in err_msg:
+                    raise HTTPException(status_code=400, detail="This video is unavailable or private.")
+                raise HTTPException(status_code=400, detail=f"Failed to fetch details: {err_msg}")
 
-    raise HTTPException(status_code=500, detail="Download engine not available.")
+            print(f"yt-dlp bot-detected, trying Invidious fallback...")
+            # Fall through to Invidious below
+
+    # ── Invidious cookie-free fallback ────────────────────────────────────────
+    if HAS_HTTPX:
+        video_id = extract_video_id(url)
+        if video_id:
+            inv_data = invidious_get_info(video_id)
+            if inv_data:
+                return invidious_info_to_response(inv_data, url)
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "Failed to fetch video info. YouTube is blocking cloud server requests. "
+            "Add YOUTUBE_COOKIES to Render environment variables to bypass this, "
+            "or the video may be private/unavailable."
+        )
+    )
+
 
 
 @app.get("/api/download")
