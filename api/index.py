@@ -118,15 +118,56 @@ import random
 COOKIE_FILES: List[str] = []
 
 
+def clean_netscape_cookies(raw_text: str) -> str:
+    """Filter out volatile/conflicting cookies and preserve stable auth tokens."""
+    allowed_cookies = {
+        'SID', 'HSID', 'SSID', 'APISID', 'SAPISID',
+        'LOGIN_INFO', '__Secure-1PSID', '__Secure-3PSID',
+        '__Secure-1PAPISID', '__Secure-3PAPISID', 'PREF'
+    }
+    lines = raw_text.splitlines()
+    clean_lines = ['# Netscape HTTP Cookie File']
+    for l in lines:
+        if l.startswith('#'):
+            continue
+        parts = l.strip().split('\t')
+        if len(parts) >= 7:
+            name = parts[5]
+            if name in allowed_cookies:
+                clean_lines.append(l)
+            elif not any(bad in name for bad in ['CONSISTENCY', 'ROLLOUT', 'YNID', 'YSC', 'PSIDTS', 'VISITOR']):
+                clean_lines.append(l)
+    return '\n'.join(clean_lines) + '\n'
+
+
 def init_cookie_pool():
-    """Discover and initialize multiple cookie accounts from env variables and files."""
+    """Discover, sanitize, and initialize multiple cookie accounts from env variables and files."""
     global COOKIE_FILES
     COOKIE_FILES = []
 
     # 1. Local cookie files
-    for local_file in ['cookies.txt', 'youtube_cookies.txt', '/tmp/cookies.txt', 'cookies_1.txt', 'cookies_2.txt']:
-        if os.path.exists(local_file) and local_file not in COOKIE_FILES:
-            COOKIE_FILES.append(local_file)
+    candidate_paths = [
+        'cookie.txt', 'cookies.txt', 'youtube_cookies.txt', '/tmp/cookies.txt',
+        'cookies_1.txt', 'cookies_2.txt',
+        os.path.join(os.path.dirname(__file__), '..', 'cookie.txt'),
+        os.path.join(os.path.dirname(__file__), '..', 'cookies.txt'),
+        os.path.join(os.path.dirname(__file__), 'cookie.txt'),
+    ]
+
+    for local_file in candidate_paths:
+        if os.path.exists(local_file):
+            try:
+                with open(local_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read().strip()
+                if content:
+                    cleaned = clean_netscape_cookies(content)
+                    tf = tempfile.NamedTemporaryFile(delete=False, suffix='_cleaned_cookie.txt', mode='w', encoding='utf-8')
+                    tf.write(cleaned)
+                    tf.close()
+                    if tf.name not in COOKIE_FILES:
+                        COOKIE_FILES.append(tf.name)
+            except Exception as e:
+                print(f"Notice: Failed to load local cookie {local_file}: {e}")
 
     # 2. Environment variables: YOUTUBE_COOKIES, YOUTUBE_COOKIES_1, YOUTUBE_COOKIES_2, etc.
     cookie_entries = []
@@ -148,8 +189,9 @@ def init_cookie_pool():
                 except Exception:
                     pass
 
+            cleaned = clean_netscape_cookies(raw_cookie)
             f = tempfile.NamedTemporaryFile(delete=False, suffix=f'_yt_cookie_{idx}.txt', mode='w', encoding='utf-8')
-            f.write(raw_cookie)
+            f.write(cleaned)
             f.close()
             COOKIE_FILES.append(f.name)
         except Exception as e:

@@ -72,6 +72,9 @@ lerna-debug.log*
 .env.development.local
 .env.test.local
 .env.production.local
+cookie.txt
+cookies.txt
+*cookie*.txt
 
 # IDE & Editor Configs
 .vscode/*
