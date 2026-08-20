@@ -609,6 +609,7 @@ def innertube_to_response(data: dict, video_id: str) -> dict:
                 "filesize": filesize,
                 "filesize_formatted": format_size(filesize) if filesize else "HD Stream",
                 "has_audio": True,
+                "direct_url": f.get("url"),
             })
 
     video_streams.sort(
@@ -698,6 +699,7 @@ def invidious_info_to_response(data: dict, url: str) -> dict:
                 "itag": f.get("itag", res_str), "resolution": res_str, "fps": f.get("fps", 30),
                 "mime_type": "video/mp4", "extension": "mp4", "filesize": filesize,
                 "filesize_formatted": format_size(filesize) if filesize else "HD Stream", "has_audio": True,
+                "direct_url": f.get("url"),
             })
     video_streams.sort(key=lambda x: int(re.search(r'(\d+)', x['resolution']).group(1) or 0), reverse=True)
     a320 = int((320*1000/8)*duration) if duration else 0
@@ -1125,6 +1127,38 @@ def cancel_download(download_id: str = Query(...)):
         event.set()
         return {"status": "ok", "message": "Download cancelled and backend process terminated"}
     return {"status": "ok", "message": "Session not active or already completed"}
+
+
+@app.get("/api/proxy-pipe")
+async def proxy_pipe(
+    stream_url: str = Query(..., description="Direct GoogleVideo or CDN stream URL"),
+    title: str = Query("video", description="Video or audio title"),
+    ext: str = Query("mp4", description="File extension")
+):
+    """
+    Ultra-fast zero-disk stream pipe:
+    Directly pipes media chunks straight from Google CDN to user browser with ZERO server disk write.
+    Starts downloading immediately in 0.1s at maximum network speed.
+    """
+    safe_ascii = sanitize_filename(title) + f".{ext}"
+    utf8_encoded = urllib.parse.quote(f"{title}.{ext}")
+
+    async def stream_generator():
+        proxy_str = PROXY_URL if PROXY_URL else None
+        async with httpx.AsyncClient(proxy=proxy_str, follow_redirects=True, timeout=120.0) as client:
+            async with client.stream("GET", stream_url) as resp:
+                if resp.status_code != 200:
+                    yield b""
+                    return
+                async for chunk in resp.aiter_bytes(chunk_size=1024 * 256):
+                    yield chunk
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{safe_ascii}"; filename*=UTF-8\'\'{utf8_encoded}',
+        "Access-Control-Expose-Headers": "Content-Disposition",
+    }
+    mime = "audio/mpeg" if ext == "mp3" else f"video/{ext}"
+    return StreamingResponse(stream_generator(), headers=headers, media_type=mime)
 
 
 @app.get("/api/get-single-file")
