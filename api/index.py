@@ -293,16 +293,14 @@ def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
         else:
             cookie_file_path = random.choice(COOKIE_FILES)
 
-    extractor_args: dict = {'youtube': {}}
-
-    # When proxy is present, android + web clients fetch full DASH adaptive streams (1080p, 720p, etc.)
+    # Player client order: web + ios + mweb + android gives full 1080p/720p DASH video formats
     if PO_TOKEN:
         extractor_args['youtube']['po_token'] = [f'web+{PO_TOKEN}']
-        extractor_args['youtube']['player_client'] = ['web', 'mweb', 'android']
+        extractor_args['youtube']['player_client'] = ['web', 'ios', 'mweb', 'android']
     elif PROXY_URL:
-        extractor_args['youtube']['player_client'] = ['android', 'web', 'mweb']
+        extractor_args['youtube']['player_client'] = ['web', 'ios', 'mweb', 'android']
     elif cookie_file_path:
-        extractor_args['youtube']['player_client'] = ['tv_embedded', 'web_embedded', 'mweb', 'android', 'web']
+        extractor_args['youtube']['player_client'] = ['tv_embedded', 'web_embedded', 'mweb', 'ios', 'web']
     else:
         extractor_args['youtube']['player_client'] = ['tv_embedded', 'web_embedded', 'mweb']
 
@@ -312,10 +310,11 @@ def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
         'socket_timeout': 15,
         'retries': 3,
         'fragment_retries': 3,
-        'concurrent_fragment_downloads': 5,   # 5x parallel downloading for maximum speed over proxy
-        'buffersize': 1024 * 1024,
-        'http_chunk_size': 10485760,          # 10MB chunked downloads
+        'concurrent_fragment_downloads': 8,   # 8x parallel downloading for maximum speed
+        'buffersize': 2 * 1024 * 1024,
+        'http_chunk_size': 20971520,          # 20MB chunked downloads
         'nocheckcertificate': True,
+        'merge_output_format': 'mp4',
         'extractor_args': extractor_args,
         'http_headers': {
             'User-Agent': (
@@ -946,11 +945,12 @@ async def download_single_sse(
                 if itag.isdigit():
                     fmt = f"{itag}+bestaudio/best/{itag}/best" if has_ffmpeg else f"{itag}/best"
                 elif itag in ["1080p", "720p", "480p", "360p", "240p", "144p"]:
-                    height_val = itag.replace("p", "")
-                    fmt = f"bestvideo[height<={height_val}]+bestaudio/best[height<={height_val}]/best" if has_ffmpeg else f"best[height<={height_val}]/best"
+                    h = itag.replace("p", "")
+                    fmt = f"bestvideo[height<={h}]+bestaudio/best[height<={h}]/bestvideo+bestaudio/best" if has_ffmpeg else f"best[height<={h}]/best"
                 else:
                     fmt = "bestvideo+bestaudio/best" if has_ffmpeg else "best"
                 ydl_opts_['format'] = fmt
+                ydl_opts_['merge_output_format'] = 'mp4'
 
         def progress_hook(d):
             if cancel_event.is_set():
@@ -997,29 +997,23 @@ async def download_single_sse(
         def worker():
             try:
                 strategies_dl = []
+
+                # Strategy 1: High-Speed Direct Stream (Google CDN does not throttle, full 10-20 MB/s speed)
                 s1 = get_base_ydl_opts()
+                s1.pop('proxy', None)
                 s1['outtmpl'] = out_template
                 s1['progress_hooks'] = [progress_hook]
                 _build_fmt(s1)
-                strategies_dl.append(("primary", s1))
+                strategies_dl.append(("direct-high-speed", s1))
 
-                if COOKIE_FILES:
+                # Strategy 2: Proxy Fallback (if direct connection encounters bot error)
+                if PROXY_URL:
                     s2 = get_base_ydl_opts()
-                    s2.pop('cookiefile', None)
+                    s2['proxy'] = PROXY_URL
                     s2['outtmpl'] = out_template
                     s2['progress_hooks'] = [progress_hook]
-                    if PROXY_URL:
-                        s2['proxy'] = PROXY_URL
                     _build_fmt(s2)
-                    strategies_dl.append(("no-cookie-fallback", s2))
-
-                if PROXY_URL:
-                    s3 = get_base_ydl_opts()
-                    s3.pop('proxy', None)
-                    s3['outtmpl'] = out_template
-                    s3['progress_hooks'] = [progress_hook]
-                    _build_fmt(s3)
-                    strategies_dl.append(("direct-no-proxy-fallback", s3))
+                    strategies_dl.append(("proxy-fallback", s2))
 
                 info_res = None
                 dl_file = None
