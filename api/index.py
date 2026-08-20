@@ -267,7 +267,6 @@ def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
     - Cookie pool rotation
     - Proxy support (PROXY_URL env var)
     - PO token support (PO_TOKEN env var)
-    - Optimal player client selection for cloud IPs
     """
     global COOKIE_FILES
     if not COOKIE_FILES:
@@ -280,25 +279,19 @@ def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
         else:
             cookie_file_path = random.choice(COOKIE_FILES)
 
-    # Client strategy based on what's available
-    if PO_TOKEN:
-        # PO token lets us use web client directly — most reliable
-        player_clients = ['web', 'tv_embedded', 'web_embedded']
-    elif cookie_file_path:
-        player_clients = ['tv_embedded', 'web_embedded', 'mweb', 'ios', 'web']
-    else:
-        # No cookies, no PO token — use clients least flagged on datacenter IPs
-        player_clients = ['tv_embedded', 'web_embedded', 'mweb']
+    extractor_args: dict = {'youtube': {}}
 
-    extractor_args: dict = {
-        'youtube': {
-            'player_client': player_clients,
-        }
-    }
-
-    # Add PO token if configured
+    # When proxy is present, yt-dlp defaults or standard clients work best
     if PO_TOKEN:
         extractor_args['youtube']['po_token'] = [f'web+{PO_TOKEN}']
+        extractor_args['youtube']['player_client'] = ['web', 'mweb', 'android', 'ios']
+    elif PROXY_URL:
+        # Residential proxy means we don't need obscure client workarounds
+        extractor_args['youtube']['player_client'] = ['web', 'mweb', 'android', 'ios', 'tv']
+    elif cookie_file_path:
+        extractor_args['youtube']['player_client'] = ['tv_embedded', 'web_embedded', 'mweb', 'ios', 'web']
+    else:
+        extractor_args['youtube']['player_client'] = ['tv_embedded', 'web_embedded', 'mweb']
 
     opts: dict = {
         'quiet': True,
@@ -323,7 +316,6 @@ def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
     if cookie_file_path:
         opts['cookiefile'] = cookie_file_path
 
-    # Apply proxy if configured
     if PROXY_URL:
         opts['proxy'] = PROXY_URL
 
@@ -332,76 +324,55 @@ def get_base_ydl_opts(cookie_idx: Optional[int] = None) -> dict:
 
 def _ytdlp_extract_info(url: str) -> Optional[dict]:
     """
-    Try yt-dlp with multiple strategies in order:
-    1. Current cookie pool + optimal clients
-    2. No cookies + tv_embedded only (bypasses cookie-related bot checks)
-    3. With proxy (if PROXY_URL set) + all clients
-    Returns None if all strategies fail with bot errors (so fallbacks can run).
-    Raises HTTPException for non-bot errors (video unavailable, etc.).
+    Try yt-dlp with multiple strategies:
+    1. If proxy is present: Use proxy with standard clients & cookies
+    2. Default yt-dlp extractor settings
+    3. tv_embedded / web_embedded clients fallback
+    Returns None if all fail so fallbacks (Innertube/Invidious) can run.
     """
     if not HAS_YTDLP:
         return None
 
     base_extract_opts = {'skip_download': True, 'extract_flat': 'in_playlist'}
-
     strategies = []
 
-    # Strategy 1: Standard — cookies + optimal clients
+    # Strategy 1: Standard with configured options
     s1 = get_base_ydl_opts()
     s1.update(base_extract_opts)
-    strategies.append(("cookies+optimal", s1))
+    strategies.append(("primary", s1))
 
-    # Strategy 2: No cookies — tv_embedded is less flagged without credentials
-    if COOKIE_FILES:
-        s2 = get_base_ydl_opts()
-        s2.pop('cookiefile', None)
-        s2['extractor_args'] = {
-            'youtube': {'player_client': ['tv_embedded', 'web_embedded']}
-        }
-        if PO_TOKEN:
-            s2['extractor_args']['youtube']['po_token'] = [f'web+{PO_TOKEN}']
-        if PROXY_URL:
-            s2['proxy'] = PROXY_URL
-        s2.update(base_extract_opts)
-        strategies.append(("no-cookies+tv_embedded", s2))
+    # Strategy 2: Default yt-dlp player clients (no extractor_args override)
+    s2 = get_base_ydl_opts()
+    s2.pop('extractor_args', None)
+    s2.update(base_extract_opts)
+    strategies.append(("default-clients", s2))
 
-    # Strategy 3: Proxy with all clients (if proxy configured)
-    if PROXY_URL:
-        s3 = get_base_ydl_opts()
-        s3['proxy'] = PROXY_URL
-        s3['extractor_args'] = {
-            'youtube': {'player_client': ['web', 'tv_embedded', 'ios', 'android', 'mweb']}
-        }
-        if PO_TOKEN:
-            s3['extractor_args']['youtube']['po_token'] = [f'web+{PO_TOKEN}']
-        s3.update(base_extract_opts)
-        strategies.append(("proxy+all-clients", s3))
+    # Strategy 3: TV client without cookies
+    s3 = get_base_ydl_opts()
+    s3.pop('cookiefile', None)
+    s3['extractor_args'] = {
+        'youtube': {'player_client': ['tv_embedded', 'web_embedded', 'mweb']}
+    }
+    s3.update(base_extract_opts)
+    strategies.append(("tv-embedded-no-cookie", s3))
 
     for strategy_name, opts in strategies:
         try:
             print(f"[yt-dlp] Trying strategy: {strategy_name}")
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-            print(f"[yt-dlp] Success with strategy: {strategy_name}")
-            return info
+            if info:
+                print(f"[yt-dlp] Success with strategy: {strategy_name}")
+                return info
         except Exception as e:
             err_msg = str(e)
-            is_bot = (
-                "Sign in to confirm" in err_msg or
-                "not a bot" in err_msg or
-                "bot" in err_msg.lower() or
-                "cookies" in err_msg.lower() or
-                "confirm your age" in err_msg.lower()
-            )
-            print(f"[yt-dlp] Strategy '{strategy_name}' failed (bot={is_bot}): {err_msg[:120]}")
-            if not is_bot:
-                # Non-bot errors should surface immediately
-                if "Video unavailable" in err_msg or "Private video" in err_msg:
-                    raise HTTPException(status_code=400, detail="This video is unavailable or private.")
-                raise HTTPException(status_code=400, detail=f"Failed to fetch details: {err_msg}")
-            continue  # Bot error — try next strategy
+            print(f"[yt-dlp] Strategy '{strategy_name}' failed: {err_msg[:120]}")
+            if "Video unavailable" in err_msg or "Private video" in err_msg or "removed by the uploader" in err_msg:
+                raise HTTPException(status_code=400, detail="This video is unavailable or private.")
+            # Format/client/bot error -> try next strategy or fallback
+            continue
 
-    return None  # All strategies failed with bot errors — proceed to fallbacks
+    return None  # All strategies exhausted — proceed to Innertube/Invidious fallbacks
 
 
 @app.get("/api/health")
